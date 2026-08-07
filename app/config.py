@@ -1,0 +1,57 @@
+from functools import lru_cache
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Base de données
+    database_url: str
+    redis_url: str = "redis://localhost:6379/0"
+
+    @field_validator("database_url")
+    @classmethod
+    def _force_asyncpg_driver(cls, v: str) -> str:
+        # Render (et d'autres hébergeurs) fournissent DATABASE_URL au format
+        # "postgres://..." ou "postgresql://..." (driver sync par défaut).
+        # SQLAlchemy async a besoin explicitement du driver asyncpg.
+        if v.startswith("postgres://"):
+            v = v.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif v.startswith("postgresql://") and "+asyncpg" not in v:
+            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
+
+    # Sécurité applicative
+    jwt_secret_key: str
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60
+
+    # JEKO Africa
+    jeko_base_url: str
+    jeko_api_key: str
+    jeko_merchant_id: str
+    jeko_webhook_secret: str
+    jeko_timeout_seconds: int = 15
+
+    public_base_url: str
+
+    # --- SMS (OTP) ---
+    sms_provider: str = "console"  # console | twilio | orange
+    sms_timeout_seconds: int = 10
+
+    # Twilio
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = None
+    twilio_from_number: str | None = None
+
+    # Orange SMS API (prioritaire pour la Côte d'Ivoire / UEMOA)
+    orange_client_id: str | None = None
+    orange_client_secret: str | None = None
+    orange_sender_address: str | None = None  # ex: "tel:+2250000000"
+    orange_sender_name: str | None = None
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()

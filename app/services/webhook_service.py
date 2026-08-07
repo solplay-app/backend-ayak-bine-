@@ -1,0 +1,145 @@
+"""
+Traitement idempotent des webhooks JEKO.
+
+Deux niveaux de protection contre les doublons (JEKO peut renvoyer le même
+webhook plusieurs fois en cas de timeout réseau de son côté) :
+  1. Verrou Redis court-terme sur `jeko_transaction_id` (anti double-traitement
+     concurrent, ex: 2 webhooks reçus à 200ms d'intervalle).
+  2. Vérification en base : si la transaction est déjà dans un état terminal
+     (SUCCESS/FAILED/CANCELLED), le webhook est acquitté (200) mais ignoré.
+"""
+from __future__ import annotations
+
+import logging
+
+from redis.asyncio import Redis
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.device_token import DeviceToken
+from app.models.models import Transaction, TransactionStatus, TransactionType
+from app.schemas.schemas import JekoWebhookPayload
+from app.services.push_service import get_push_service
+from app.services.wallet_service import credit_wallet, get_wallet_for_update
+
+logger = logging.getLogger("webhook_service")
+
+TERMINAL_STATUSES = {TransactionStatus.SUCCESS, TransactionStatus.FAILED, TransactionStatus.CANCELLED}
+WEBHOOK_DEDUP_TTL_SECONDS = 300
+
+# Mapping des statuts JEKO -> statuts internes
+JEKO_STATUS_MAP = {
+    "SUCCESS": TransactionStatus.SUCCESS,
+    "SUCCESSFUL": TransactionStatus.SUCCESS,
+    "COMPLETED": TransactionStatus.SUCCESS,
+    "FAILED": TransactionStatus.FAILED,
+    "CANCELLED": TransactionStatus.CANCELLED,
+    "PENDING": TransactionStatus.PENDING,
+}
+
+
+class WebhookAlreadyProcessed(Exception):
+    pass
+
+
+class TransactionNotFound(Exception):
+    pass
+
+
+async def acquire_webhook_dedup_lock(redis: Redis, jeko_transaction_id: str) -> bool:
+    """Retourne True si ce webhook n'a jamais été vu (et pose le verrou), False sinon."""
+    key = f"webhook:jeko:{jeko_transaction_id}"
+    return bool(await redis.set(key, "1", nx=True, ex=WEBHOOK_DEDUP_TTL_SECONDS))
+
+
+async def _notify_user_best_effort(db: AsyncSession, transaction: Transaction) -> None:
+    """
+    Envoie une notification push best-effort à tous les appareils de
+    l'utilisateur. Toute erreur est capturée et loggée : la notification
+    ne doit JAMAIS faire échouer le traitement métier du webhook.
+    """
+    push_service = get_push_service()
+    if push_service is None:
+        return
+
+    try:
+        result = await db.execute(select(DeviceToken).where(DeviceToken.user_id == transaction.user_id))
+        tokens = result.scalars().all()
+        if not tokens:
+            return
+
+        if transaction.status == TransactionStatus.SUCCESS:
+            title, body = "Opération réussie", f"Votre transaction de {transaction.amount} XOF a été confirmée."
+        elif transaction.status == TransactionStatus.FAILED:
+            title, body = "Opération échouée", f"Votre transaction de {transaction.amount} XOF a échoué. Solde recrédité si applicable."
+        else:
+            return
+
+        for device in tokens:
+            try:
+                await push_service.send(
+                    device.fcm_token,
+                    title,
+                    body,
+                    data={"internal_reference": transaction.internal_reference, "status": transaction.status.value},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Échec envoi push à un device: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Échec notification push (best-effort, ignoré): %s", exc)
+
+
+async def process_jeko_webhook(
+    db: AsyncSession,
+    redis: Redis,
+    payload: JekoWebhookPayload,
+) -> Transaction:
+    """
+    Applique le webhook JEKO de façon idempotente :
+      - retrouve la transaction via `internal_reference`
+      - si déjà dans un état terminal -> no-op (idempotent, renvoie la transaction telle quelle)
+      - sinon applique la mutation de solde correspondant au type de transaction
+    """
+    is_new = await acquire_webhook_dedup_lock(redis, payload.jeko_transaction_id)
+    if not is_new:
+        logger.info("Webhook JEKO %s déjà en cours/traité, ignoré", payload.jeko_transaction_id)
+        raise WebhookAlreadyProcessed(payload.jeko_transaction_id)
+
+    stmt = select(Transaction).where(Transaction.internal_reference == payload.reference)
+    result = await db.execute(stmt)
+    transaction = result.scalar_one_or_none()
+
+    if transaction is None:
+        raise TransactionNotFound(payload.reference)
+
+    if transaction.status in TERMINAL_STATUSES:
+        # Idempotence : webhook redondant sur une transaction déjà finalisée
+        logger.info("Transaction %s déjà finalisée (%s), webhook ignoré", transaction.internal_reference, transaction.status)
+        return transaction
+
+    new_status = JEKO_STATUS_MAP.get(payload.status.upper(), TransactionStatus.PENDING)
+    transaction.jeko_reference = payload.jeko_transaction_id
+
+    if new_status == TransactionStatus.SUCCESS:
+        if transaction.type == TransactionType.DEPOSIT:
+            # Cash-In confirmé : on crédite le wallet applicatif
+            wallet = await get_wallet_for_update(db, transaction.user_id)
+            await credit_wallet(db, wallet, transaction.amount)
+        # Pour un WITHDRAWAL réussi, le débit a déjà été effectué à l'initiation
+        # (voir wallet_service.debit_wallet dans l'endpoint /withdraw) : rien à faire de plus.
+        transaction.status = TransactionStatus.SUCCESS
+
+    elif new_status == TransactionStatus.FAILED:
+        if transaction.type == TransactionType.WITHDRAWAL:
+            # Le solde avait été débité de manière optimiste à l'initiation : on le recrédite
+            wallet = await get_wallet_for_update(db, transaction.user_id)
+            await credit_wallet(db, wallet, transaction.amount + transaction.fee)
+        transaction.status = TransactionStatus.FAILED
+        transaction.metadata_ = {**(transaction.metadata_ or {}), "failure_reason": payload.failure_reason}
+
+    else:
+        transaction.status = new_status
+
+    await db.flush()
+    await _notify_user_best_effort(db, transaction)
+    return transaction
