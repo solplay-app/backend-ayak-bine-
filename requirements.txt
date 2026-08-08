@@ -9,5 +9,13 @@ httpx==0.27.2
 redis==5.0.8
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+# Épingle explicite requise : passlib 1.7.4 effectue un auto-test interne au
+# premier appel pour détecter la version du backend bcrypt, en hashant une
+# chaîne de test qui dépasse 72 octets. Les versions bcrypt >= 4.1 sont
+# devenues strictes sur cette limite (ValueError au lieu d'une troncature
+# silencieuse comme avant), ce qui fait planter CE test interne — même pour
+# un simple code PIN à 4 chiffres qui, lui, ne dépasse jamais 72 octets.
+# Voir : https://github.com/pyca/bcrypt/issues/684
+bcrypt==4.0.1
 python-multipart==0.0.9
 tenacity==9.0.0
