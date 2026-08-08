@@ -73,7 +73,7 @@ async def deposit(
     await db.commit()
 
     try:
-        jeko_response = await jeko.initiate_payin(
+        jeko_response = await jeko.create_deposit_payment_request(
             internal_reference=internal_reference,
             amount=payload.amount,
             operator=payload.operator.value,
@@ -93,13 +93,13 @@ async def deposit(
             detail="Service de paiement momentanément indisponible, réessayez.",
         ) from exc
 
-    transaction.jeko_reference = jeko_response.get("transaction_id")
+    transaction.jeko_reference = jeko_response.get("id")
     await db.commit()
 
     return DepositResponse(
         internal_reference=internal_reference,
         status=TransactionStatus.PENDING,
-        payment_link=jeko_response.get("payment_link"),
+        payment_link=None,  # mode forceProviderDirect : pas de page de paiement à afficher
         message="Dépôt initié. Confirmez l'opération sur votre téléphone.",
     )
 
@@ -153,11 +153,12 @@ async def withdraw(
         ) from exc
 
     try:
-        jeko_response = await jeko.initiate_payout(
+        jeko_response = await jeko.create_withdrawal_transfer(
             internal_reference=internal_reference,
             amount=payload.amount,
             operator=payload.operator.value,
             phone_number=payload.phone_number,
+            beneficiary_name=current_user.full_name,
         )
     except (JekoAPIError, JekoNetworkError) as exc:
         # Échec d'initiation : on recrédite immédiatement le wallet et on clôture la transaction
@@ -174,7 +175,7 @@ async def withdraw(
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail) from exc
 
-    transaction.jeko_reference = jeko_response.get("transaction_id")
+    transaction.jeko_reference = jeko_response.get("id")
     await db.commit()
 
     return WithdrawResponse(

@@ -28,7 +28,9 @@ services:
         sync: false
       - key: JEKO_API_KEY
         sync: false
-      - key: JEKO_MERCHANT_ID
+      - key: JEKO_API_KEY_ID
+        sync: false
+      - key: JEKO_STORE_ID
         sync: false
       - key: JEKO_WEBHOOK_SECRET
         sync: false

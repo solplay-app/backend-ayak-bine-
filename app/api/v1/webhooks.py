@@ -24,7 +24,7 @@ async def jeko_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
-    x_jeko_signature: str | None = Header(default=None, alias="X-Jeko-Signature"),
+    x_jeko_signature: str | None = Header(default=None, alias="Jeko-Signature"),
 ):
     """
     Réception des notifications JEKO (Pay-In & Pay-Out).
@@ -60,7 +60,7 @@ async def jeko_webhook(
         return {"received": True, "status": "already_processed"}
     except TransactionNotFound as exc:
         await db.rollback()
-        logger.error("Webhook JEKO pour une transaction inconnue: %s", payload.reference)
+        logger.error("Webhook JEKO pour une transaction inconnue: %s", payload.data.transactionDetails)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction inconnue") from exc
 
     return {"received": True, "internal_reference": transaction.internal_reference, "status": transaction.status}

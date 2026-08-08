@@ -27,10 +27,12 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60
 
-    # JEKO Africa
-    jeko_base_url: str
+    # JEKO Africa (voir https://developer.jeko.africa)
+    # Authentification réelle JEKO : deux en-têtes distincts, PAS un Bearer token.
+    jeko_base_url: str = "https://api.jeko.africa"
     jeko_api_key: str
-    jeko_merchant_id: str
+    jeko_api_key_id: str
+    jeko_store_id: str  # storeId JEKO — obligatoire sur presque tous les endpoints
     jeko_webhook_secret: str
     jeko_timeout_seconds: int = 15
 

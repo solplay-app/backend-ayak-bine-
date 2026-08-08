@@ -27,14 +27,13 @@ logger = logging.getLogger("webhook_service")
 TERMINAL_STATUSES = {TransactionStatus.SUCCESS, TransactionStatus.FAILED, TransactionStatus.CANCELLED}
 WEBHOOK_DEDUP_TTL_SECONDS = 300
 
-# Mapping des statuts JEKO -> statuts internes
+# Mapping des statuts JEKO -> statuts internes.
+# La vraie API JEKO n'utilise que deux valeurs en minuscules : "success" et
+# "error" (pas de "pending"/"cancelled" côté webhook — un webhook n'est
+# envoyé qu'une fois la transaction terminée, dans un sens ou l'autre).
 JEKO_STATUS_MAP = {
-    "SUCCESS": TransactionStatus.SUCCESS,
-    "SUCCESSFUL": TransactionStatus.SUCCESS,
-    "COMPLETED": TransactionStatus.SUCCESS,
-    "FAILED": TransactionStatus.FAILED,
-    "CANCELLED": TransactionStatus.CANCELLED,
-    "PENDING": TransactionStatus.PENDING,
+    "success": TransactionStatus.SUCCESS,
+    "error": TransactionStatus.FAILED,
 }
 
 
@@ -100,25 +99,30 @@ async def process_jeko_webhook(
       - si déjà dans un état terminal -> no-op (idempotent, renvoie la transaction telle quelle)
       - sinon applique la mutation de solde correspondant au type de transaction
     """
-    is_new = await acquire_webhook_dedup_lock(redis, payload.jeko_transaction_id)
+    is_new = await acquire_webhook_dedup_lock(redis, payload.data.id)
     if not is_new:
-        logger.info("Webhook JEKO %s déjà en cours/traité, ignoré", payload.jeko_transaction_id)
-        raise WebhookAlreadyProcessed(payload.jeko_transaction_id)
+        logger.info("Webhook JEKO %s déjà en cours/traité, ignoré", payload.data.id)
+        raise WebhookAlreadyProcessed(payload.data.id)
 
-    stmt = select(Transaction).where(Transaction.internal_reference == payload.reference)
+    internal_reference = payload.data.transactionDetails.reference if payload.data.transactionDetails else None
+    if not internal_reference:
+        # Sans référence exploitable, impossible de retrouver notre transaction.
+        raise TransactionNotFound(payload.data.id)
+
+    stmt = select(Transaction).where(Transaction.internal_reference == internal_reference)
     result = await db.execute(stmt)
     transaction = result.scalar_one_or_none()
 
     if transaction is None:
-        raise TransactionNotFound(payload.reference)
+        raise TransactionNotFound(internal_reference)
 
     if transaction.status in TERMINAL_STATUSES:
         # Idempotence : webhook redondant sur une transaction déjà finalisée
         logger.info("Transaction %s déjà finalisée (%s), webhook ignoré", transaction.internal_reference, transaction.status)
         return transaction
 
-    new_status = JEKO_STATUS_MAP.get(payload.status.upper(), TransactionStatus.PENDING)
-    transaction.jeko_reference = payload.jeko_transaction_id
+    new_status = JEKO_STATUS_MAP.get(payload.data.status.lower(), TransactionStatus.PENDING)
+    transaction.jeko_reference = payload.data.id
 
     if new_status == TransactionStatus.SUCCESS:
         if transaction.type == TransactionType.DEPOSIT:
@@ -135,7 +139,10 @@ async def process_jeko_webhook(
             wallet = await get_wallet_for_update(db, transaction.user_id)
             await credit_wallet(db, wallet, transaction.amount + transaction.fee)
         transaction.status = TransactionStatus.FAILED
-        transaction.metadata_ = {**(transaction.metadata_ or {}), "failure_reason": payload.failure_reason}
+        transaction.metadata_ = {
+            **(transaction.metadata_ or {}),
+            "failure_reason": payload.data.description or "Transaction refusée par l'opérateur",
+        }
 
     else:
         transaction.status = new_status

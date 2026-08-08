@@ -123,13 +123,41 @@ class RegisterDeviceRequest(BaseModel):
 
 # ---------- Webhook JEKO ----------
 
-class JekoWebhookPayload(BaseModel):
-    """Structure générique du webhook JEKO (Pay-In & Pay-Out)."""
+class JekoMoneyModel(BaseModel):
+    amount: int  # en centimes, cf. doc JEKO
+    currency: str
 
-    reference: str = Field(description="Référence interne envoyée à JEKO (internal_reference)")
-    jeko_transaction_id: str
-    status: str  # ex: SUCCESS / FAILED / PENDING côté JEKO
-    amount: Decimal
-    operator: str | None = None
-    failure_reason: str | None = None
-    raw: dict[str, Any] | None = None
+
+class JekoTransactionDetails(BaseModel):
+    id: str | None = None
+    reference: str | None = None  # notre internal_reference, si on l'a fournie à la création
+    paymentLinkId: str | None = None
+
+
+class JekoWebhookTransactionData(BaseModel):
+    """Corps du champ `data` du webhook JEKO `transaction.completed`."""
+
+    id: str
+    amount: JekoMoneyModel
+    fees: JekoMoneyModel
+    status: str  # "success" ou "error" (JEKO n'utilise pas de majuscules)
+    counterpartLabel: str | None = None
+    counterpartIdentifier: str | None = None
+    paymentMethod: str | None = None
+    transactionType: str  # "payment" ou "transfer"
+    businessName: str | None = None
+    storeName: str | None = None
+    description: str | None = None
+    executedAt: str | None = None
+    transactionDetails: JekoTransactionDetails | None = None
+
+
+class JekoWebhookPayload(BaseModel):
+    """
+    Structure réelle du webhook JEKO (voir developer.jeko.africa/webhooks).
+    Un seul type d'événement existe : "transaction.completed".
+    """
+
+    event: str
+    data: JekoWebhookTransactionData
+    timestamp: str | None = None
