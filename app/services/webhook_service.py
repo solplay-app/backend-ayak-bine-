@@ -17,10 +17,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.device_token import DeviceToken
-from app.models.models import Transaction, TransactionStatus, TransactionType
+from app.models.models import Transaction, TransactionStatus
 from app.schemas.schemas import JekoWebhookPayload
 from app.services.push_service import get_push_service
-from app.services.wallet_service import credit_wallet, get_wallet_for_update
+from app.services.wallet_service import credit_commission, get_wallet_for_update
 
 logger = logging.getLogger("webhook_service")
 
@@ -51,26 +51,27 @@ async def acquire_webhook_dedup_lock(redis: Redis, jeko_transaction_id: str) -> 
     return bool(await redis.set(key, "1", nx=True, ex=WEBHOOK_DEDUP_TTL_SECONDS))
 
 
-async def _notify_user_best_effort(db: AsyncSession, transaction: Transaction) -> None:
+async def _notify_agent_best_effort(db: AsyncSession, transaction: Transaction) -> None:
     """
     Envoie une notification push best-effort à tous les appareils de
-    l'utilisateur. Toute erreur est capturée et loggée : la notification
-    ne doit JAMAIS faire échouer le traitement métier du webhook.
+    l'AGENT. Toute erreur est capturée et loggée : la notification ne doit
+    JAMAIS faire échouer le traitement métier du webhook.
     """
     push_service = get_push_service()
     if push_service is None:
         return
 
     try:
-        result = await db.execute(select(DeviceToken).where(DeviceToken.user_id == transaction.user_id))
+        result = await db.execute(select(DeviceToken).where(DeviceToken.user_id == transaction.agent_id))
         tokens = result.scalars().all()
         if not tokens:
             return
 
         if transaction.status == TransactionStatus.SUCCESS:
-            title, body = "Opération réussie", f"Votre transaction de {transaction.amount} XOF a été confirmée."
+            title = "Opération réussie"
+            body = f"Transaction de {transaction.amount} XOF confirmée. Commission : +{transaction.commission_amount} XOF."
         elif transaction.status == TransactionStatus.FAILED:
-            title, body = "Opération échouée", f"Votre transaction de {transaction.amount} XOF a échoué. Solde recrédité si applicable."
+            title, body = "Opération échouée", f"La transaction de {transaction.amount} XOF a échoué."
         else:
             return
 
@@ -125,19 +126,15 @@ async def process_jeko_webhook(
     transaction.jeko_reference = payload.data.id
 
     if new_status == TransactionStatus.SUCCESS:
-        if transaction.type == TransactionType.DEPOSIT:
-            # Cash-In confirmé : on crédite le wallet applicatif
-            wallet = await get_wallet_for_update(db, transaction.user_id)
-            await credit_wallet(db, wallet, transaction.amount)
-        # Pour un WITHDRAWAL réussi, le débit a déjà été effectué à l'initiation
-        # (voir wallet_service.debit_wallet dans l'endpoint /withdraw) : rien à faire de plus.
+        # Peu importe le sens (Cash-In ou Cash-Out), l'agent a droit à sa
+        # commission dès que JEKO confirme le succès réel de l'opération.
+        wallet = await get_wallet_for_update(db, transaction.agent_id)
+        await credit_commission(db, wallet, transaction.commission_amount)
         transaction.status = TransactionStatus.SUCCESS
 
     elif new_status == TransactionStatus.FAILED:
-        if transaction.type == TransactionType.WITHDRAWAL:
-            # Le solde avait été débité de manière optimiste à l'initiation : on le recrédite
-            wallet = await get_wallet_for_update(db, transaction.user_id)
-            await credit_wallet(db, wallet, transaction.amount + transaction.fee)
+        # Aucun solde interne n'a été débité à l'initiation (le float réel
+        # est géré par JEKO) : rien à recréditer, juste marquer l'échec.
         transaction.status = TransactionStatus.FAILED
         transaction.metadata_ = {
             **(transaction.metadata_ or {}),
@@ -148,5 +145,5 @@ async def process_jeko_webhook(
         transaction.status = new_status
 
     await db.flush()
-    await _notify_user_best_effort(db, transaction)
+    await _notify_agent_best_effort(db, transaction)
     return transaction
