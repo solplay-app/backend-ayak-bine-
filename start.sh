@@ -2,9 +2,9 @@
 set -e
 
 # ⚠️ RUN_RESET_DB=true supprime TOUTES les tables puis les recrée avec le
-# schéma actuel. Usage ponctuel uniquement (ex: passage à l'ancien schéma
-# vers le nouveau schéma "agent"). Ne JAMAIS laisser cette variable à true
-# une fois de vraies données en base.
+# schéma actuel. Usage ponctuel uniquement (ex: passage à un schéma
+# incompatible). Ne JAMAIS laisser cette variable à true une fois de
+# vraies données en base.
 if [ "$RUN_RESET_DB" = "true" ]; then
   echo "RUN_RESET_DB=true -> suppression puis recréation des tables..."
   python -m scripts.reset_db

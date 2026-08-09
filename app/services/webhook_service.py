@@ -1,149 +1,195 @@
 """
-Traitement idempotent des webhooks JEKO.
+Traitement des webhooks JEKO (`transaction.completed`) — Ayak'bine v2.
 
-Deux niveaux de protection contre les doublons (JEKO peut renvoyer le même
-webhook plusieurs fois en cas de timeout réseau de son côté) :
-  1. Verrou Redis court-terme sur `jeko_transaction_id` (anti double-traitement
-     concurrent, ex: 2 webhooks reçus à 200ms d'intervalle).
-  2. Vérification en base : si la transaction est déjà dans un état terminal
-     (SUCCESS/FAILED/CANCELLED), le webhook est acquitté (200) mais ignoré.
+Contrairement à un simple Cash-In/Cash-Out à une étape, un TRANSFER v2 est
+une opération en DEUX étapes chaînées, chacune confirmée par SON PROPRE
+webhook (références dérivées `{internal_reference}-IN` puis `-OUT`) :
+
+  1. Webhook sur la référence "...-IN" (pay-in, collecte chez le client) :
+       - succès  -> on déclenche IMMÉDIATEMENT le pay-out vers le destinataire
+       - échec   -> rien n'a été collecté, transfert FAILED, aucun impact wallet
+
+  2. Webhook sur la référence "...-OUT" (pay-out, versement au destinataire) :
+       - succès  -> transfert (ou retrait) SUCCESS
+       - échec   -> le montant collecté (moins la commission JEKO déjà
+                    déduite au pay-in) est recrédité sur le wallet interne
+                    du client (filet de sécurité) ; statut FAILED_PAYOUT
+                    pour un TRANSFER, FAILED pour un WITHDRAWAL simple
+                    (recrédit intégral, il n'y a pas eu de pay-in séparé).
+
+Un WITHDRAWAL n'a qu'une étape ("...-OUT" uniquement, payin_status déjà
+SUCCESS dès la création — voir wallet_service.create_pending_withdrawal).
 """
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.device_token import DeviceToken
-from app.models.models import Transaction, TransactionStatus
+from app.models.models import Transaction, TransactionStatus, TransactionType
 from app.schemas.schemas import JekoWebhookPayload
-from app.services.push_service import get_push_service
-from app.services.wallet_service import credit_commission, get_wallet_for_update
+from app.services.fee_rules import compute_wallet_credit_on_payout_failure
+from app.services.jeko_client import JekoAPIError, JekoClient, JekoNetworkError
+from app.services.wallet_service import credit_wallet, get_wallet_for_update
 
 logger = logging.getLogger("webhook_service")
 
-TERMINAL_STATUSES = {TransactionStatus.SUCCESS, TransactionStatus.FAILED, TransactionStatus.CANCELLED}
-WEBHOOK_DEDUP_TTL_SECONDS = 300
-
-# Mapping des statuts JEKO -> statuts internes.
-# La vraie API JEKO n'utilise que deux valeurs en minuscules : "success" et
-# "error" (pas de "pending"/"cancelled" côté webhook — un webhook n'est
-# envoyé qu'une fois la transaction terminée, dans un sens ou l'autre).
-JEKO_STATUS_MAP = {
-    "success": TransactionStatus.SUCCESS,
-    "error": TransactionStatus.FAILED,
-}
+TERMINAL_LEG_STATUSES = {TransactionStatus.SUCCESS, TransactionStatus.FAILED}
 
 
 class WebhookAlreadyProcessed(Exception):
-    pass
+    """Ce webhook JEKO (par son id) a déjà été traité — à acquitter sans le retraiter."""
 
 
 class TransactionNotFound(Exception):
-    pass
+    """Aucune transaction interne ne correspond à la référence reçue."""
 
 
-async def acquire_webhook_dedup_lock(redis: Redis, jeko_transaction_id: str) -> bool:
-    """Retourne True si ce webhook n'a jamais été vu (et pose le verrou), False sinon."""
-    key = f"webhook:jeko:{jeko_transaction_id}"
-    return bool(await redis.set(key, "1", nx=True, ex=WEBHOOK_DEDUP_TTL_SECONDS))
-
-
-async def _notify_agent_best_effort(db: AsyncSession, transaction: Transaction) -> None:
+def _split_reference(reference: str) -> tuple[str, str]:
     """
-    Envoie une notification push best-effort à tous les appareils de
-    l'AGENT. Toute erreur est capturée et loggée : la notification ne doit
-    JAMAIS faire échouer le traitement métier du webhook.
+    "TRF-ABCD1234-IN" -> ("TRF-ABCD1234", "IN")
+    "WDR-ABCD1234-OUT" -> ("WDR-ABCD1234", "OUT")
     """
-    push_service = get_push_service()
-    if push_service is None:
-        return
+    if reference.endswith("-IN"):
+        return reference[: -len("-IN")], "IN"
+    if reference.endswith("-OUT"):
+        return reference[: -len("-OUT")], "OUT"
+    # Référence inattendue (ancien format, ou appel manuel de test) : on la
+    # traite telle quelle comme un "OUT" par défaut plutôt que de planter,
+    # mais ce cas ne devrait normalement jamais se produire en usage normal.
+    logger.warning("Référence webhook sans suffixe -IN/-OUT reconnu: %s", reference)
+    return reference, "OUT"
 
-    try:
-        result = await db.execute(select(DeviceToken).where(DeviceToken.user_id == transaction.agent_id))
-        tokens = result.scalars().all()
-        if not tokens:
-            return
 
-        if transaction.status == TransactionStatus.SUCCESS:
-            title = "Opération réussie"
-            body = f"Transaction de {transaction.amount} XOF confirmée. Commission : +{transaction.commission_amount} XOF."
-        elif transaction.status == TransactionStatus.FAILED:
-            title, body = "Opération échouée", f"La transaction de {transaction.amount} XOF a échoué."
-        else:
-            return
-
-        for device in tokens:
-            try:
-                await push_service.send(
-                    device.fcm_token,
-                    title,
-                    body,
-                    data={"internal_reference": transaction.internal_reference, "status": transaction.status.value},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Échec envoi push à un device: %s", exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Échec notification push (best-effort, ignoré): %s", exc)
+async def acquire_webhook_dedup_lock(redis: Redis, jeko_event_id: str) -> bool:
+    """SETNX Redis : True si c'est la première fois qu'on voit cet id JEKO."""
+    key = f"webhook:jeko:{jeko_event_id}"
+    return bool(await redis.set(key, "1", nx=True, ex=60 * 60 * 24))
 
 
 async def process_jeko_webhook(
     db: AsyncSession,
     redis: Redis,
     payload: JekoWebhookPayload,
+    jeko: JekoClient,
 ) -> Transaction:
-    """
-    Applique le webhook JEKO de façon idempotente :
-      - retrouve la transaction via `internal_reference`
-      - si déjà dans un état terminal -> no-op (idempotent, renvoie la transaction telle quelle)
-      - sinon applique la mutation de solde correspondant au type de transaction
-    """
-    is_new = await acquire_webhook_dedup_lock(redis, payload.data.id)
+    data = payload.data
+
+    is_new = await acquire_webhook_dedup_lock(redis, data.id)
     if not is_new:
-        logger.info("Webhook JEKO %s déjà en cours/traité, ignoré", payload.data.id)
-        raise WebhookAlreadyProcessed(payload.data.id)
+        logger.info("Webhook JEKO %s déjà en cours/traité, ignoré", data.id)
+        raise WebhookAlreadyProcessed(data.id)
 
-    internal_reference = payload.data.transactionDetails.reference if payload.data.transactionDetails else None
-    if not internal_reference:
-        # Sans référence exploitable, impossible de retrouver notre transaction.
-        raise TransactionNotFound(payload.data.id)
+    if data.transactionDetails is None or not data.transactionDetails.reference:
+        raise TransactionNotFound("(reference manquante dans transactionDetails)")
 
-    stmt = select(Transaction).where(Transaction.internal_reference == internal_reference)
+    base_reference, leg = _split_reference(data.transactionDetails.reference)
+
+    stmt = select(Transaction).where(Transaction.internal_reference == base_reference)
     result = await db.execute(stmt)
     transaction = result.scalar_one_or_none()
-
     if transaction is None:
-        raise TransactionNotFound(internal_reference)
+        raise TransactionNotFound(base_reference)
 
-    if transaction.status in TERMINAL_STATUSES:
-        # Idempotence : webhook redondant sur une transaction déjà finalisée
-        logger.info("Transaction %s déjà finalisée (%s), webhook ignoré", transaction.internal_reference, transaction.status)
-        return transaction
+    is_success = data.status.lower() == "success"
+    new_leg_status = TransactionStatus.SUCCESS if is_success else TransactionStatus.FAILED
 
-    new_status = JEKO_STATUS_MAP.get(payload.data.status.lower(), TransactionStatus.PENDING)
-    transaction.jeko_reference = payload.data.id
+    if leg == "IN":
+        await _handle_payin_webhook(db, transaction, new_leg_status, jeko_event_id=data.id, jeko=jeko)
+    else:
+        await _handle_payout_webhook(db, transaction, new_leg_status)
 
-    if new_status == TransactionStatus.SUCCESS:
-        # Peu importe le sens (Cash-In ou Cash-Out), l'agent a droit à sa
-        # commission dès que JEKO confirme le succès réel de l'opération.
-        wallet = await get_wallet_for_update(db, transaction.agent_id)
-        await credit_commission(db, wallet, transaction.commission_amount)
-        transaction.status = TransactionStatus.SUCCESS
+    return transaction
 
-    elif new_status == TransactionStatus.FAILED:
-        # Aucun solde interne n'a été débité à l'initiation (le float réel
-        # est géré par JEKO) : rien à recréditer, juste marquer l'échec.
+
+async def _handle_payin_webhook(
+    db: AsyncSession,
+    transaction: Transaction,
+    new_status: TransactionStatus,
+    *,
+    jeko_event_id: str,
+    jeko: JekoClient,
+) -> None:
+    if transaction.payin_status in TERMINAL_LEG_STATUSES:
+        logger.info("Pay-in déjà finalisé pour %s (%s), webhook ignoré", transaction.internal_reference, transaction.payin_status)
+        return
+
+    transaction.payin_status = new_status
+
+    if new_status == TransactionStatus.FAILED:
+        # Rien n'a été collecté : le transfert entier échoue, aucun impact wallet.
         transaction.status = TransactionStatus.FAILED
+        return
+
+    # Pay-in réussi : on déclenche IMMÉDIATEMENT le pay-out vers le destinataire.
+    try:
+        jeko_response = await jeko.create_withdrawal_transfer(
+            internal_reference=f"{transaction.internal_reference}-OUT",
+            amount=Decimal(transaction.amount),
+            operator=transaction.destination_operator.value,
+            phone_number=transaction.recipient_phone,
+            beneficiary_name=transaction.recipient_name or "Bénéficiaire",
+        )
+        transaction.jeko_payout_id = jeko_response.get("id")
+        transaction.payout_status = TransactionStatus.PENDING
+        # status global reste PENDING jusqu'au webhook du pay-out
+    except (JekoAPIError, JekoNetworkError) as exc:
+        # Le pay-in a réussi mais on n'a même pas pu INITIER le pay-out :
+        # aucun webhook de pay-out ne viendra jamais pour cette tentative.
+        # On recrédite tout de suite plutôt que de laisser l'argent bloqué
+        # en attente d'un événement qui n'arrivera pas.
+        logger.error(
+            "Échec d'initiation du pay-out après pay-in réussi (%s): %s",
+            transaction.internal_reference, exc,
+        )
+        wallet = await get_wallet_for_update(db, transaction.user_id)
+        credit_amount = compute_wallet_credit_on_payout_failure(
+            Decimal(transaction.total_collected), transaction.source_operator
+        )
+        await credit_wallet(db, wallet, credit_amount)
+        transaction.payout_status = TransactionStatus.FAILED
+        transaction.status = TransactionStatus.FAILED_PAYOUT
         transaction.metadata_ = {
             **(transaction.metadata_ or {}),
-            "failure_reason": payload.data.description or "Transaction refusée par l'opérateur",
+            "payout_initiation_error": str(exc),
         }
 
-    else:
-        transaction.status = new_status
 
-    await db.flush()
-    await _notify_agent_best_effort(db, transaction)
-    return transaction
+
+async def _handle_payout_webhook(
+    db: AsyncSession,
+    transaction: Transaction,
+    new_status: TransactionStatus,
+) -> None:
+    if transaction.payout_status in TERMINAL_LEG_STATUSES:
+        logger.info("Pay-out déjà finalisé pour %s (%s), webhook ignoré", transaction.internal_reference, transaction.payout_status)
+        return
+
+    transaction.payout_status = new_status
+
+    if new_status == TransactionStatus.SUCCESS:
+        transaction.status = TransactionStatus.SUCCESS
+        return
+
+    # Pay-out échoué : on recrédite le wallet.
+    wallet = await get_wallet_for_update(db, transaction.user_id)
+
+    if transaction.type == TransactionType.TRANSFER:
+        # Le pay-in avait réussi (sinon on ne serait jamais arrivé à l'étape
+        # pay-out) : on recrédite le total collecté, net de la commission
+        # JEKO déjà déduite silencieusement à la collecte.
+        credit_amount = compute_wallet_credit_on_payout_failure(
+            Decimal(transaction.total_collected), transaction.source_operator
+        )
+        transaction.status = TransactionStatus.FAILED_PAYOUT
+    else:
+        # WITHDRAWAL simple : le montant avait été débité intégralement du
+        # wallet à l'initiation (voir wallet.py) ; aucun frais plateforme
+        # sur un retrait (fee=0), donc recrédit intégral du montant débité.
+        credit_amount = Decimal(transaction.amount)
+        transaction.status = TransactionStatus.FAILED
+
+    await credit_wallet(db, wallet, credit_amount)

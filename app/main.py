@@ -3,15 +3,15 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import agent, auth, devices, webhooks
+from app.api.v1 import auth, devices, transfers, wallet, webhooks
 from app.services.jeko_client import get_jeko_client
 from app.services.sms import close_sms_provider
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
-    title="Ayak'bine — Plateforme Agent Mobile Money",
-    description="Backend Agent (Cash-In / Cash-Out / Commissions) - Intégration JEKO Africa",
+    title="Ayak'bine — Transfert interopérable Mobile Money",
+    description="Wave ⇄ Orange Money ⇄ MTN MoMo ⇄ Moov Money, sans agent ni cash — Intégration JEKO Africa",
     version="2.0.0",
 )
 
@@ -24,7 +24,8 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(devices.router)
-app.include_router(agent.router)
+app.include_router(wallet.router)
+app.include_router(transfers.router)
 app.include_router(webhooks.router)
 
 

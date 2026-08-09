@@ -25,7 +25,7 @@ async def main() -> None:
         await conn.run_sync(Base.metadata.drop_all)
         print("🗑️  Anciennes tables supprimées.")
         await conn.run_sync(Base.metadata.create_all)
-    print("✅ Tables recréées avec le nouveau schéma agent.")
+    print("✅ Tables recréées avec le nouveau schéma v2 (transfert inter-opérateurs).")
 
 
 if __name__ == "__main__":

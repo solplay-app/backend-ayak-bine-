@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, get_redis
 from app.schemas.schemas import JekoWebhookPayload
+from app.services.jeko_client import JekoClient, get_jeko_client
 from app.services.webhook_service import (
     TransactionNotFound,
     WebhookAlreadyProcessed,
@@ -24,6 +25,7 @@ async def jeko_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
+    jeko: JekoClient = Depends(get_jeko_client),
     x_jeko_signature: str | None = Header(default=None, alias="Jeko-Signature"),
 ):
     """
@@ -53,14 +55,14 @@ async def jeko_webhook(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
     try:
-        transaction = await process_jeko_webhook(db, redis, payload)
+        transaction = await process_jeko_webhook(db, redis, payload, jeko)
         await db.commit()
     except WebhookAlreadyProcessed:
         # Idempotence : on acquitte quand même pour éviter les retries JEKO
         return {"received": True, "status": "already_processed"}
     except TransactionNotFound as exc:
         await db.rollback()
-        logger.error("Webhook JEKO pour une transaction inconnue: %s", payload.data.transactionDetails)
+        logger.error("Webhook JEKO pour une référence inconnue: %s", exc)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction inconnue") from exc
 
     return {"received": True, "internal_reference": transaction.internal_reference, "status": transaction.status}
