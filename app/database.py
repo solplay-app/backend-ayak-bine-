@@ -8,7 +8,17 @@ from app.config import get_settings
 
 settings = get_settings()
 
-engine = create_async_engine(settings.database_url, pool_pre_ping=True, pool_size=10, max_overflow=20)
+engine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    # Timeout explicite : sans ça, asyncpg peut rester bloqué indéfiniment si
+    # la base est injoignable/pas encore prête (ex: cold start Render), ce qui
+    # empêche uvicorn de démarrer et de binder le port -> déploiement qui
+    # échoue silencieusement après le timeout de scan de port de Render.
+    connect_args={"timeout": 10, "command_timeout": 30},
+)
 AsyncSessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
 
 
