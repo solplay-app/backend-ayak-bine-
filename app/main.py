@@ -32,8 +32,11 @@ app.include_router(webhooks.router)
 @app.get("/health", tags=["Monitoring"])
 async def health_check():
     return {"status": "ok"}
-
-
+    
+@app.get("/", tags=["Monitoring"])
+async def root():
+    return {"status": "ok", "service": "Ayak'bine API", "/docs": "/docs"}
+             
 @app.on_event("shutdown")
 async def shutdown_event():
     await get_jeko_client().close()
