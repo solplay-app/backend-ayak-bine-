@@ -3,7 +3,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import auth, devices, transfers, wallet, webhooks
+from app.api.v1 import admin, auth, devices, transfers, wallet, webhooks
 from app.services.jeko_client import get_jeko_client
 from app.services.sms import close_sms_provider
 
@@ -22,6 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(admin.router)
 app.include_router(auth.router)
 app.include_router(devices.router)
 app.include_router(wallet.router)
@@ -32,11 +33,8 @@ app.include_router(webhooks.router)
 @app.get("/health", tags=["Monitoring"])
 async def health_check():
     return {"status": "ok"}
-    
-@app.get("/", tags=["Monitoring"])
-async def root():
-    return {"status": "ok", "service": "Ayak'bine API", "/docs": "/docs"}
-             
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     await get_jeko_client().close()
