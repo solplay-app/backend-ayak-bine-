@@ -207,6 +207,11 @@ class JekoClient:
         logger.info("Création transfer JEKO (retrait) ref=%s montant=%s", internal_reference, amount)
         return await self._request("POST", "/partner_api/transfers", json_body=body)
 
+    async def get_transfer_status(self, jeko_transfer_id: str) -> dict[str, Any]:
+        """Statut réel côté JEKO d'un transfert (pay-out), utilisé par le script de réconciliation
+        quand un webhook n'a jamais pu être livré (ex: service endormi sur un plan gratuit)."""
+        return await self._request("GET", f"/partner_api/transfers/{jeko_transfer_id}")
+
     # ---------- Magasin ----------
 
     async def get_store_balance(self) -> dict[str, Any]:
