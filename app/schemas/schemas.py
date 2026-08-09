@@ -8,14 +8,30 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.models.models import MobileOperator, TransactionStatus, TransactionType
 from app.services.fee_rules import MAX_TRANSFER_AMOUNT, MIN_TRANSFER_AMOUNT
 
-CI_PHONE_PATTERN = r"^(\+225)?0?[0-9]{10}$"
+CI_PHONE_PATTERN = r"^(\+225)?0[0-9]{9}$"
 
 
 def _normalize_ci_phone(v: str) -> str:
+    """
+    Normalise un numéro ivoirien saisi sous forme locale (ex: '07 79 32 16 19'
+    ou '0779321619') vers le format international E.164 (+2250779321619).
+
+    ⚠️ Depuis la réforme de la numérotation ivoirienne (2021), le zéro
+    initial fait partie intégrante du numéro à 10 chiffres (ce n'est PAS un
+    préfixe interurbain à retirer, contrairement à d'anciens plans de
+    numérotation d'autres pays) : +225 0779321619, jamais +225 779321619.
+    Le retirer produit un numéro à 9 chiffres invalide, rejeté par JEKO
+    (\"payerPhone field format is invalid\").
+    """
     v = v.strip().replace(" ", "")
-    if not v.startswith("+225"):
-        v = "+225" + v.lstrip("0")
-    return v
+    if v.startswith("+225"):
+        return v
+    if v.startswith("00225"):
+        return "+225" + v[5:]
+    if v.startswith("225") and len(v) == 13:
+        return "+" + v
+    # Format local (0779321619, 10 chiffres) : on conserve le 0 initial.
+    return "+225" + v
 
 
 # ---------- Transfert inter-opérateurs (2 étapes chaînées : pay-in + pay-out) ----------
