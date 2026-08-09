@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     orange_sender_address: str | None = None  # ex: "tel:+2250000000"
     orange_sender_name: str | None = None
 
+    # --- Admin (réconciliation manuelle sans Shell, plan gratuit Render) ---
+    # Doit être défini en variable d'environnement Render (onglet "Environment",
+    # PAS besoin de Shell). Si absent, la route /admin/reconcile-transaction
+    # refuse tout accès (403), donc pas de risque à laisser le code déployé.
+    admin_reconcile_secret: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:
