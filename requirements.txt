@@ -20,3 +20,4 @@ bcrypt==4.0.1
 python-multipart==0.0.9
 tenacity==9.0.0
 google-auth==2.35.0
+requests==2.32.3
