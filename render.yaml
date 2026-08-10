@@ -44,3 +44,9 @@ services:
         value: "10"
       - key: RUN_INIT_DB
         value: "false" # passer à "true" temporairement au tout premier déploiement
+      - key: ADMIN_RECONCILE_SECRET
+        generateValue: true # protège /api/v1/admin/* (réconciliation manuelle sans Shell)
+      - key: FIREBASE_PROJECT_ID
+        sync: false # ID du projet Firebase, ex: "ayak-bine"
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false # contenu JSON complet du compte de service Firebase
