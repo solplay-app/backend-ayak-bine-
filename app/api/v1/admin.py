@@ -121,6 +121,7 @@ async def user_transaction_history(
         ],
     }
 
+@router.get("/pending-transactions")
 async def list_pending_transactions(
     secret: str = Query(...),
     db: AsyncSession = Depends(get_db),
