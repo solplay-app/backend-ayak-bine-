@@ -59,6 +59,19 @@ class Settings(BaseSettings):
     # refuse tout accès (403), donc pas de risque à laisser le code déployé.
     admin_reconcile_secret: str | None = None
 
+    # --- Notifications push (Firebase Cloud Messaging) ---
+    # `firebase_project_id` : l'ID du projet Firebase (ex: "ayak-bine"),
+    # visible dans Firebase Console > Paramètres du projet > Général.
+    # `firebase_service_account_json` : le CONTENU COMPLET (pas un chemin de
+    # fichier) du fichier JSON de compte de service Firebase, collé tel quel
+    # dans la variable d'environnement. Généré depuis Firebase Console >
+    # Paramètres du projet > Comptes de service > "Générer une nouvelle clé
+    # privée". Si l'un des deux est absent, les push sont simplement
+    # désactivés (mode dégradé silencieux) : l'app continue de fonctionner
+    # via le polling déjà en place côté écran de statut.
+    firebase_project_id: str | None = None
+    firebase_service_account_json: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:
