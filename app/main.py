@@ -1,41 +1,154 @@
-import logging
+"""
+Route de réconciliation manuelle utilisable SANS Shell (contournement pour
+le plan gratuit Render, où le Shell est désactivé : "Shell is not supported
+for free instance types").
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+Fonctionne en collant simplement une URL dans le navigateur, protégée par un
+mot de passe secret (`ADMIN_RECONCILE_SECRET`, à définir dans Render ->
+onglet "Environment", PAS besoin de Shell pour ça).
 
-from app.api.v1 import admin, auth, devices, transfers, wallet, webhooks
-from app.services.jeko_client import get_jeko_client
-from app.services.sms import close_sms_provider
+⚠️ Cette route reste un GET (plus simple à utiliser depuis un navigateur)
+mais peut déclencher un vrai versement d'argent (--apply). Elle est donc
+protégée par un secret long et aléatoire, et n'agit QUE sur une transaction
+précise passée en paramètre — jamais en masse.
+"""
+from __future__ import annotations
 
-logging.basicConfig(level=logging.INFO)
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
-app = FastAPI(
-    title="Ayak'bine — Transfert interopérable Mobile Money",
-    description="Wave ⇄ Orange Money ⇄ MTN MoMo ⇄ Moov Money, sans agent ni cash — Intégration JEKO Africa",
-    version="2.0.0",
+from app.config import get_settings
+from app.database import get_db
+from app.services.jeko_client import JekoClient, get_jeko_client
+from app.services.reconciliation import (
+    TransactionNotFoundForReconciliation,
+    reconcile_transaction_by_reference,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # à restreindre en production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(admin.router)
-app.include_router(auth.router)
-app.include_router(devices.router)
-app.include_router(wallet.router)
-app.include_router(transfers.router)
-app.include_router(webhooks.router)
+router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
+settings = get_settings()
 
 
-@app.get("/health", tags=["Monitoring"])
-async def health_check():
-    return {"status": "ok"}
+def _check_secret(secret: str) -> None:
+    if not settings.admin_reconcile_secret:
+        # Route jamais activée si le secret n'a pas été configuré côté Render :
+        # évite qu'un déploiement oublié laisse la route ouverte à tout le monde.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Route admin non configurée.")
+    if secret != settings.admin_reconcile_secret:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Secret invalide.")
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await get_jeko_client().close()
-    await close_sms_provider()
+@router.get("/reconcile-transaction")
+async def reconcile_transaction(
+    secret: str = Query(..., description="Doit correspondre à ADMIN_RECONCILE_SECRET"),
+    reference: str = Query(..., description="Référence interne, ex: TRF-ABCD1234"),
+    apply: bool = Query(False, description="false = dry-run (rien n'est modifié), true = applique réellement"),
+    db: AsyncSession = Depends(get_db),
+    jeko: JekoClient = Depends(get_jeko_client),
+):
+    """
+    Vérifie le vrai statut d'une transaction auprès de JEKO et, si `apply=true`,
+    rejoue le traitement qu'aurait dû faire le webhook manqué (déclenche le
+    pay-out en attente, ou recrédite le wallet si le pay-out a échoué).
+
+    Utilisation (coller dans le navigateur) :
+      https://TON-SERVICE.onrender.com/api/v1/admin/reconcile-transaction?secret=...&reference=TRF-XXXX
+      https://TON-SERVICE.onrender.com/api/v1/admin/reconcile-transaction?secret=...&reference=TRF-XXXX&apply=true
+    """
+    _check_secret(secret)
+
+    try:
+        return await reconcile_transaction_by_reference(db, jeko, reference, apply=apply)
+    except TransactionNotFoundForReconciliation:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Transaction '{reference}' introuvable.")
+
+
+@router.get("/user-history")
+async def user_transaction_history(
+    secret: str = Query(...),
+    reference: str = Query(..., description="N'importe quelle référence interne d'une transaction de ce client, ex: TRF-FE7064473D0B44F2"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrouve le client propriétaire d'une transaction donnée, puis liste
+    TOUT son historique (avec le solde wallet actuel), pour vérifier
+    précisément d'où vient un solde donné (utile après une réconciliation
+    manuelle, pour confirmer qu'un montant recrédité correspond bien à ce
+    qui était attendu).
+
+    Utilisation (coller dans le navigateur) :
+      https://TON-SERVICE.onrender.com/api/v1/admin/user-history?secret=...&reference=TRF-XXXX
+    """
+    _check_secret(secret)
+
+    from sqlalchemy import select
+
+    from app.models.models import Transaction, Wallet
+
+    result = await db.execute(select(Transaction).where(Transaction.internal_reference == reference))
+    anchor_transaction = result.scalar_one_or_none()
+    if anchor_transaction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Transaction '{reference}' introuvable.")
+
+    user_id = anchor_transaction.user_id
+
+    wallet_result = await db.execute(select(Wallet).where(Wallet.user_id == user_id))
+    wallet = wallet_result.scalar_one_or_none()
+
+    history_result = await db.execute(
+        select(Transaction).where(Transaction.user_id == user_id).order_by(Transaction.created_at.asc())
+    )
+    transactions = history_result.scalars().all()
+
+    return {
+        "user_id": str(user_id),
+        "current_wallet_balance": str(wallet.balance) if wallet else None,
+        "transaction_count": len(transactions),
+        "history": [
+            {
+                "internal_reference": t.internal_reference,
+                "type": t.type.value,
+                "amount": str(t.amount),
+                "fee": str(t.fee),
+                "total_collected": str(t.total_collected) if t.total_collected is not None else None,
+                "status": t.status.value,
+                "payin_status": t.payin_status.value if t.payin_status else None,
+                "payout_status": t.payout_status.value if t.payout_status else None,
+                "recipient_phone": t.recipient_phone,
+                "created_at": t.created_at.isoformat(),
+            }
+            for t in transactions
+        ],
+    }
+
+@router.get("/pending-transactions")
+async def list_pending_transactions(
+    secret: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Liste les références des transactions encore PENDING, pour éviter de
+    devoir passer par le Shell juste pour les retrouver.
+
+    Utilisation (coller dans le navigateur) :
+      https://TON-SERVICE.onrender.com/api/v1/admin/pending-transactions?secret=...
+    """
+    _check_secret(secret)
+
+    from sqlalchemy import select
+
+    from app.models.models import Transaction, TransactionStatus
+
+    result = await db.execute(select(Transaction).where(Transaction.status == TransactionStatus.PENDING))
+    transactions = result.scalars().all()
+    return [
+        {
+            "internal_reference": t.internal_reference,
+            "type": t.type.value,
+            "amount": str(t.amount),
+            "payin_status": t.payin_status.value if t.payin_status else None,
+            "payout_status": t.payout_status.value if t.payout_status else None,
+            "created_at": t.created_at.isoformat(),
+        }
+        for t in transactions
+    ]
