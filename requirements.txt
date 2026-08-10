@@ -19,3 +19,4 @@ passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
 python-multipart==0.0.9
 tenacity==9.0.0
+google-auth==2.35.0
