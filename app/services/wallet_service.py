@@ -1,13 +1,4 @@
-"""
-Service métier bas niveau pour les transactions et le wallet du CLIENT
-FINAL (plus un modèle d'agent — voir models.py pour le contexte du pivot v2).
-
-Responsabilités :
-  - Génération de références internes idempotentes
-  - Locking distribué (Redis) contre les doubles-soumissions concurrentes
-  - Création des transactions en base (PENDING)
-  - Crédit/débit du wallet interne, avec verrou pessimiste PostgreSQL
-"""
+"""Service métier bas niveau pour le wallet et les transactions utilisateur."""
 from __future__ import annotations
 
 import uuid
@@ -25,11 +16,11 @@ LOCK_TTL_SECONDS = 15
 
 
 class WalletLockError(Exception):
-    """Une opération concurrente est déjà en cours pour cet utilisateur."""
+    pass
 
 
 class InsufficientBalanceError(Exception):
-    """Le solde wallet est insuffisant pour couvrir le retrait demandé."""
+    pass
 
 
 def generate_internal_reference(prefix: str) -> str:
@@ -38,8 +29,6 @@ def generate_internal_reference(prefix: str) -> str:
 
 @asynccontextmanager
 async def user_redis_lock(redis: Redis, user_id: uuid.UUID) -> AsyncIterator[None]:
-    """Verrou distribué Redis (SETNX) empêchant deux opérations simultanées
-    (ex: double-tap sur \"Confirmer\") pour le même utilisateur."""
     lock_key = f"user:lock:{user_id}"
     acquired = await redis.set(lock_key, "1", nx=True, ex=LOCK_TTL_SECONDS)
     if not acquired:
@@ -51,10 +40,40 @@ async def user_redis_lock(redis: Redis, user_id: uuid.UUID) -> AsyncIterator[Non
 
 
 async def get_wallet_for_update(db: AsyncSession, user_id: uuid.UUID) -> Wallet:
-    """Verrou pessimiste PostgreSQL sur le wallet du client (SELECT ... FOR UPDATE)."""
     stmt = select(Wallet).where(Wallet.user_id == user_id).with_for_update()
     result = await db.execute(stmt)
     return result.scalar_one()
+
+
+async def create_pending_deposit(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    internal_reference: str,
+    operator: MobileOperator,
+    amount: Decimal,
+    source_phone: str,
+) -> Transaction:
+    transaction = Transaction(
+        internal_reference=internal_reference,
+        user_id=user_id,
+        type=TransactionType.DEPOSIT,
+        source_operator=operator,
+        destination_operator=None,
+        amount=amount,
+        fee=Decimal("0"),
+        total_collected=amount,
+        jeko_deposit_fee_rate=Decimal("0"),
+        payin_status=TransactionStatus.PENDING,
+        payout_status=None,
+        status=TransactionStatus.PENDING,
+        recipient_name=None,
+        recipient_phone=None,
+        metadata_={"source_phone": source_phone},
+    )
+    db.add(transaction)
+    await db.flush()
+    return transaction
 
 
 async def create_pending_transfer(
@@ -70,13 +89,8 @@ async def create_pending_transfer(
     jeko_deposit_fee_rate: Decimal,
     recipient_name: str,
     recipient_phone: str,
+    source_phone: str,
 ) -> Transaction:
-    """
-    Crée la transaction TRANSFER en base, status=PENDING, payin_status=PENDING,
-    payout_status=None (rempli seulement une fois le pay-in confirmé).
-    `internal_reference` est UNIQUE en base : toute tentative de recréation
-    avec la même référence lève une IntegrityError (protection double-clic).
-    """
     transaction = Transaction(
         internal_reference=internal_reference,
         user_id=user_id,
@@ -92,6 +106,7 @@ async def create_pending_transfer(
         status=TransactionStatus.PENDING,
         recipient_name=recipient_name,
         recipient_phone=recipient_phone,
+        metadata_={"source_phone": source_phone},
     )
     db.add(transaction)
     await db.flush()
@@ -106,11 +121,6 @@ async def create_pending_withdrawal(
     operator: MobileOperator,
     amount: Decimal,
 ) -> Transaction:
-    """
-    Crée la transaction WITHDRAWAL en base. Pas d'étape pay-in (l'argent est
-    déjà dans le wallet interne) : payin_status est directement SUCCESS,
-    seul payout_status suit la progression réelle côté JEKO.
-    """
     transaction = Transaction(
         internal_reference=internal_reference,
         user_id=user_id,
@@ -133,7 +143,6 @@ async def create_pending_withdrawal(
 
 
 async def debit_wallet(db: AsyncSession, wallet: Wallet, amount: Decimal) -> None:
-    """Débit optimiste à l'initiation d'un retrait — recrédité si le pay-out échoue ensuite."""
     if Decimal(wallet.balance) < amount:
         raise InsufficientBalanceError(f"Solde insuffisant : {wallet.balance} XOF disponible, {amount} XOF demandé.")
     wallet.balance = Decimal(wallet.balance) - amount
