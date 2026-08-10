@@ -16,6 +16,7 @@ from app.core.security import get_current_user, verify_pin
 from app.database import get_db, get_redis
 from app.models.models import TransactionStatus, User
 from app.schemas.schemas import WalletBalanceResponse, WithdrawRequest, WithdrawResponse
+from app.services.auto_reconcile import schedule_auto_reconcile
 from app.services.jeko_client import JekoAPIError, JekoClient, JekoNetworkError, get_jeko_client
 from app.services.wallet_service import (
     InsufficientBalanceError,
@@ -97,6 +98,9 @@ async def withdraw(
             await db.commit()
     except WalletLockError as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+
+    # Filet de sécurité automatique (voir app/services/auto_reconcile.py).
+    schedule_auto_reconcile(internal_reference)
 
     return WithdrawResponse(
         internal_reference=internal_reference,
