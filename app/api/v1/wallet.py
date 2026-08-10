@@ -22,6 +22,7 @@ from app.services.wallet_service import (
     InsufficientBalanceError,
     WalletLockError,
     create_pending_withdrawal,
+    credit_wallet,
     debit_wallet,
     generate_internal_reference,
     get_wallet_for_update,
@@ -83,7 +84,7 @@ async def withdraw(
                 # Échec immédiat à l'initiation (pas juste "en attente") : on
                 # recrédite tout de suite plutôt que d'attendre un webhook
                 # qui ne viendra jamais pour un appel qui n'a jamais abouti.
-                wallet.balance = wallet.balance + payload.amount
+                await credit_wallet(db, wallet, payload.amount)
                 transaction.payout_status = transaction.status = TransactionStatus.FAILED
                 await db.commit()
                 detail = (
