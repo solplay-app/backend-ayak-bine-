@@ -22,6 +22,7 @@ from app.database import get_db, get_redis
 from app.models.models import Transaction, TransactionStatus, TransactionType, User
 from app.schemas.schemas import TransferDetailResponse, TransferRequest, TransferResponse
 from app.services.fee_rules import JEKO_DEPOSIT_FEE_RATE, compute_platform_fee, compute_total_to_collect
+from app.services.auto_reconcile import schedule_auto_reconcile
 from app.services.jeko_client import JekoAPIError, JekoClient, JekoNetworkError, get_jeko_client
 from app.services.wallet_service import (
     WalletLockError,
@@ -100,6 +101,12 @@ async def create_transfer(
             await db.commit()
     except WalletLockError as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+
+    # Filet de sécurité : si le webhook JEKO ne nous parvient jamais (ex. app
+    # endormie sur le plan gratuit Render), on vérifie nous-mêmes le vrai
+    # statut après quelques minutes plutôt que de laisser le client bloqué
+    # sur "En cours" indéfiniment. Sans effet si le vrai webhook arrive avant.
+    schedule_auto_reconcile(internal_reference)
 
     return TransferResponse(
         internal_reference=internal_reference,
