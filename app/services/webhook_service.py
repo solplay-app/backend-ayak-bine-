@@ -33,11 +33,27 @@ from app.models.models import Transaction, TransactionStatus, TransactionType
 from app.schemas.schemas import JekoWebhookPayload
 from app.services.fee_rules import compute_wallet_credit_on_payout_failure
 from app.services.jeko_client import JekoAPIError, JekoClient, JekoNetworkError
+from app.services.push_service import get_push_service
 from app.services.wallet_service import credit_wallet, get_wallet_for_update
 
 logger = logging.getLogger("webhook_service")
 
 TERMINAL_LEG_STATUSES = {TransactionStatus.SUCCESS, TransactionStatus.FAILED}
+
+
+async def _notify(db: AsyncSession, transaction: Transaction, *, title: str, body: str) -> None:
+    """Envoi best-effort d'une notification push liée à cette transaction.
+    Ne fait rien si le service push n'est pas configuré (mode dégradé)."""
+    push_service = get_push_service()
+    if push_service is None:
+        return
+    await push_service.notify_user(
+        db,
+        transaction.user_id,
+        title=title,
+        body=body,
+        data={"internal_reference": transaction.internal_reference, "type": "transaction_update"},
+    )
 
 
 class WebhookAlreadyProcessed(Exception):
@@ -122,6 +138,11 @@ async def _handle_payin_webhook(
     if new_status == TransactionStatus.FAILED:
         # Rien n'a été collecté : le transfert entier échoue, aucun impact wallet.
         transaction.status = TransactionStatus.FAILED
+        await _notify(
+            db, transaction,
+            title="Transfert échoué",
+            body=f"Le paiement de {transaction.total_collected} XOF n'a pas abouti. Aucun montant n'a été débité.",
+        )
         return
 
     # Pay-in réussi : on déclenche IMMÉDIATEMENT le pay-out vers le destinataire.
@@ -156,6 +177,11 @@ async def _handle_payin_webhook(
             **(transaction.metadata_ or {}),
             "payout_initiation_error": str(exc),
         }
+        await _notify(
+            db, transaction,
+            title="Montant recrédité sur votre solde",
+            body=f"Le versement à {transaction.recipient_name or 'votre destinataire'} n'a pas pu être initié. {credit_amount} XOF ont été recrédités sur votre solde Ayak'bine.",
+        )
 
 
 
@@ -172,6 +198,11 @@ async def _handle_payout_webhook(
 
     if new_status == TransactionStatus.SUCCESS:
         transaction.status = TransactionStatus.SUCCESS
+        await _notify(
+            db, transaction,
+            title="Transfert réussi",
+            body=f"{transaction.amount} XOF ont bien été envoyés à {transaction.recipient_name or 'votre destinataire'}.",
+        )
         return
 
     # Pay-out échoué : on recrédite le wallet.
@@ -185,11 +216,16 @@ async def _handle_payout_webhook(
             Decimal(transaction.total_collected), transaction.source_operator
         )
         transaction.status = TransactionStatus.FAILED_PAYOUT
+        notif_title = "Montant recrédité sur votre solde"
+        notif_body = f"Le versement à {transaction.recipient_name or 'votre destinataire'} a échoué. {credit_amount} XOF ont été recrédités sur votre solde Ayak'bine."
     else:
         # WITHDRAWAL simple : le montant avait été débité intégralement du
         # wallet à l'initiation (voir wallet.py) ; aucun frais plateforme
         # sur un retrait (fee=0), donc recrédit intégral du montant débité.
         credit_amount = Decimal(transaction.amount)
         transaction.status = TransactionStatus.FAILED
+        notif_title = "Retrait échoué"
+        notif_body = f"Votre retrait de {credit_amount} XOF a échoué et a été recrédité sur votre solde."
 
     await credit_wallet(db, wallet, credit_amount)
+    await _notify(db, transaction, title=notif_title, body=notif_body)
