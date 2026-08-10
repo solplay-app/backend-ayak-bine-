@@ -63,7 +63,64 @@ async def reconcile_transaction(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Transaction '{reference}' introuvable.")
 
 
-@router.get("/pending-transactions")
+@router.get("/user-history")
+async def user_transaction_history(
+    secret: str = Query(...),
+    reference: str = Query(..., description="N'importe quelle référence interne d'une transaction de ce client, ex: TRF-FE7064473D0B44F2"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrouve le client propriétaire d'une transaction donnée, puis liste
+    TOUT son historique (avec le solde wallet actuel), pour vérifier
+    précisément d'où vient un solde donné (utile après une réconciliation
+    manuelle, pour confirmer qu'un montant recrédité correspond bien à ce
+    qui était attendu).
+
+    Utilisation (coller dans le navigateur) :
+      https://TON-SERVICE.onrender.com/api/v1/admin/user-history?secret=...&reference=TRF-XXXX
+    """
+    _check_secret(secret)
+
+    from sqlalchemy import select
+
+    from app.models.models import Transaction, Wallet
+
+    result = await db.execute(select(Transaction).where(Transaction.internal_reference == reference))
+    anchor_transaction = result.scalar_one_or_none()
+    if anchor_transaction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Transaction '{reference}' introuvable.")
+
+    user_id = anchor_transaction.user_id
+
+    wallet_result = await db.execute(select(Wallet).where(Wallet.user_id == user_id))
+    wallet = wallet_result.scalar_one_or_none()
+
+    history_result = await db.execute(
+        select(Transaction).where(Transaction.user_id == user_id).order_by(Transaction.created_at.asc())
+    )
+    transactions = history_result.scalars().all()
+
+    return {
+        "user_id": str(user_id),
+        "current_wallet_balance": str(wallet.balance) if wallet else None,
+        "transaction_count": len(transactions),
+        "history": [
+            {
+                "internal_reference": t.internal_reference,
+                "type": t.type.value,
+                "amount": str(t.amount),
+                "fee": str(t.fee),
+                "total_collected": str(t.total_collected) if t.total_collected is not None else None,
+                "status": t.status.value,
+                "payin_status": t.payin_status.value if t.payin_status else None,
+                "payout_status": t.payout_status.value if t.payout_status else None,
+                "recipient_phone": t.recipient_phone,
+                "created_at": t.created_at.isoformat(),
+            }
+            for t in transactions
+        ],
+    }
+
 async def list_pending_transactions(
     secret: str = Query(...),
     db: AsyncSession = Depends(get_db),
