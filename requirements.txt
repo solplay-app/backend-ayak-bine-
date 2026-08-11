@@ -20,5 +20,10 @@ bcrypt==4.0.1
 python-multipart==0.0.9
 tenacity==9.0.0
 google-auth==2.35.0
-requests>=2.20,<3
-kkiapay==0.0.6
+requests>=2.31,<3
+# kkiapay==0.0.6 est installé séparément dans le Dockerfile avec --no-deps :
+# sa contrainte transitive sur `requests` (très ancienne, ~2.22.0) est
+# incompatible avec la version moderne de urllib3 installée, ce qui casse
+# `requests` au runtime (ModuleNotFoundError: urllib3.packages.six.moves)
+# et par ricochet google-auth (utilisé par le service de notifications push).
+# --no-deps empêche cette contrainte d'influencer la résolution globale.
