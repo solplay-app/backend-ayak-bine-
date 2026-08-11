@@ -45,7 +45,10 @@ async def reconcile_transaction_by_reference(
         "actions": [],
     }
 
-    if transaction.payin_status == TransactionStatus.PENDING:
+    # --- Étape pay-in JEKO (uniquement TRANSFER : DEPOSIT est désormais sur
+    # Kkiapay temporairement, voir app/api/v1/wallet.py /deposit/confirm — ce
+    # filet de sécurité JEKO ne le concerne plus) ---
+    if transaction.type == TransactionType.TRANSFER and transaction.payin_status == TransactionStatus.PENDING:
         if not transaction.jeko_payin_id:
             report["actions"].append("payin: ignoré (aucun jeko_payin_id)")
         else:

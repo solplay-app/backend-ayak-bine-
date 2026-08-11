@@ -76,6 +76,36 @@ async def create_pending_deposit(
     return transaction
 
 
+async def finalize_kkiapay_deposit(
+    db: AsyncSession,
+    transaction: Transaction,
+    *,
+    success: bool,
+    kkiapay_transaction_id: str,
+) -> Transaction:
+    """
+    Finalise une transaction DEPOSIT après vérification server-side auprès
+    de Kkiapay. Idempotent : si la transaction n'est déjà plus PENDING
+    (déjà confirmée via /deposit/confirm OU via le webhook Kkiapay, peu
+    importe lequel des deux est arrivé en premier), on ne fait rien.
+    """
+    if transaction.payin_status != TransactionStatus.PENDING:
+        return transaction  # déjà traitée, pas de double crédit
+
+    transaction.jeko_payin_id = kkiapay_transaction_id  # champ réutilisé pour stocker la référence Kkiapay
+
+    if success:
+        wallet = await get_wallet_for_update(db, transaction.user_id)
+        await credit_wallet(db, wallet, Decimal(transaction.amount))
+        transaction.payin_status = TransactionStatus.SUCCESS
+        transaction.status = TransactionStatus.SUCCESS
+    else:
+        transaction.payin_status = TransactionStatus.FAILED
+        transaction.status = TransactionStatus.FAILED
+
+    return transaction
+
+
 async def create_pending_transfer(
     db: AsyncSession,
     *,

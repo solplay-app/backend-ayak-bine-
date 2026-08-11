@@ -1,43 +1,25 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import logging
-import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import admin, auth, devices, transfers, wallet, webhooks
-from app.database import get_redis
+from app.api.v1 import admin, auth, devices, kyc, transfers, wallet, webhooks
+from app.database import Base, engine, get_redis
 from app.services.jeko_client import get_jeko_client
-
-
-def configure_logging() -> None:
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-
-    root_logger = logging.getLogger()
-
-    if not root_logger.handlers:
-        logging.basicConfig(level=level, format=log_format)
-    else:
-        root_logger.setLevel(level)
-        formatter = logging.Formatter(log_format)
-        for handler in root_logger.handlers:
-            handler.setLevel(level)
-            if handler.formatter is None:
-                handler.setFormatter(formatter)
-
-    logging.getLogger("sms.console").setLevel(level)
-    logging.getLogger("otp_service").setLevel(level)
-
-
-configure_logging()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Crée automatiquement les tables manquantes (ex: kyc_submissions) au
+    # démarrage — sans ça il faudrait un accès Shell (indisponible sur le
+    # plan gratuit Render) pour créer la nouvelle table manuellement.
+    # Sans danger pour les tables déjà existantes : create_all ne touche
+    # jamais une table qui existe déjà, ni ses colonnes.
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
     yield
     redis = get_redis()
     await redis.close()
@@ -65,3 +47,4 @@ app.include_router(transfers.router)
 app.include_router(webhooks.router)
 app.include_router(devices.router)
 app.include_router(admin.router)
+app.include_router(kyc.router)

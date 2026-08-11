@@ -38,6 +38,20 @@ class Settings(BaseSettings):
 
     public_base_url: str
 
+    # --- Kkiapay (Sandbox temporaire pour la Recharge wallet uniquement) ---
+    # Clés disponibles sur https://app.kkiapay.me/dashboard/developers/keys
+    # kkiapay_public_key : utilisée côté app Flutter pour ouvrir le widget de paiement.
+    # kkiapay_private_key + kkiapay_secret : usage serveur uniquement (vérification + webhook).
+    # NE PAS utiliser pour Transférer/Retirer : Kkiapay n'a pas d'API de versement
+    # instantané vers un destinataire arbitraire (voir app/services/kkiapay_client.py).
+    kkiapay_public_key: str | None = None
+    kkiapay_private_key: str | None = None
+    kkiapay_secret: str | None = None
+    kkiapay_sandbox: bool = True
+
+    # --- KYC (taille max d'une image encodée en base64, ~4MB de photo réelle) ---
+    kyc_max_image_base64_chars: int = 6_000_000
+
     # --- SMS (OTP) ---
     sms_provider: str = "console"  # console | twilio | orange
     sms_timeout_seconds: int = 10

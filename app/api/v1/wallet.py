@@ -10,7 +10,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import get_current_user, verify_pin
 from app.database import get_db, get_redis
 from app.models.models import Transaction, TransactionStatus, User
-from app.schemas.schemas import DepositRequest, DepositResponse, TransactionRead, WalletBalanceResponse, WithdrawRequest, WithdrawResponse
+from app.schemas.schemas import (
+    DepositConfirmRequest,
+    DepositConfirmResponse,
+    DepositRequest,
+    DepositResponse,
+    TransactionRead,
+    WalletBalanceResponse,
+    WithdrawRequest,
+    WithdrawResponse,
+)
+from app.config import get_settings
+from app.services import kkiapay_client
 from app.services.auto_reconcile import schedule_auto_reconcile
 from app.services.jeko_client import JekoAPIError, JekoClient, JekoNetworkError, get_jeko_client
 from app.services.wallet_service import (
@@ -20,6 +31,7 @@ from app.services.wallet_service import (
     create_pending_withdrawal,
     credit_wallet,
     debit_wallet,
+    finalize_kkiapay_deposit,
     generate_internal_reference,
     get_wallet_for_update,
     user_redis_lock,
@@ -52,10 +64,24 @@ async def deposit(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     redis: Redis = Depends(get_redis),
-    jeko: JekoClient = Depends(get_jeko_client),
 ):
+    """
+    Recharge du wallet — temporairement sur Kkiapay Sandbox (JEKO en attente
+    de validation KYC). Contrairement à JEKO, c'est l'app Flutter qui ouvre
+    le widget de paiement Kkiapay avec les infos retournées ici ; le backend
+    ne fait que créer la transaction PENDING. La confirmation réelle se fait
+    ensuite via POST /deposit/confirm, vérifiée server-side auprès de Kkiapay
+    (jamais sur la seule foi du callback client, falsifiable).
+    """
     if not verify_pin(payload.pin_code, current_user.pin_code_hash):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Code PIN incorrect")
+
+    settings = get_settings()
+    if not settings.kkiapay_public_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Recharge momentanément indisponible (Kkiapay non configuré côté serveur).",
+        )
 
     source_phone = payload.source_phone or current_user.phone_number
     internal_reference = generate_internal_reference("DEP")
@@ -70,31 +96,69 @@ async def deposit(
                 amount=payload.amount,
                 source_phone=source_phone,
             )
-            try:
-                jeko_response = await jeko.create_deposit_payment_request(
-                    internal_reference=f"{internal_reference}-IN",
-                    amount=payload.amount,
-                    operator=payload.operator.value,
-                    phone_number=source_phone,
-                )
-            except JekoAPIError as exc:
-                transaction.payin_status = transaction.status = TransactionStatus.FAILED
-                await db.commit()
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Échec de l'initiation de la recharge côté JEKO: {exc.payload}") from exc
-            except JekoNetworkError as exc:
-                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Service de paiement momentanément indisponible, réessayez.") from exc
-
-            transaction.jeko_payin_id = jeko_response.get("id")
             await db.commit()
     except WalletLockError as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
 
-    schedule_auto_reconcile(internal_reference)
     return DepositResponse(
         internal_reference=internal_reference,
         status=transaction.status,
-        redirect_url=jeko_response.get("redirectUrl"),
-        message="Recharge initiée. Confirmez le paiement sur votre téléphone.",
+        amount=payload.amount,
+        message="Ouvrez le paiement Kkiapay pour confirmer la recharge.",
+        kkiapay_public_key=settings.kkiapay_public_key,
+        kkiapay_sandbox=settings.kkiapay_sandbox,
+    )
+
+
+@router.post("/deposit/confirm", response_model=DepositConfirmResponse)
+async def confirm_deposit(
+    payload: DepositConfirmRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Appelée par l'app juste après la fermeture du widget Kkiapay (succès OU
+    échec côté client). On ne fait JAMAIS confiance au callback de l'app —
+    on revérifie toujours le vrai statut auprès de Kkiapay avant de créditer
+    quoi que ce soit. Idempotent (voir finalize_kkiapay_deposit).
+    """
+    result = await db.execute(
+        select(Transaction).where(
+            Transaction.internal_reference == payload.internal_reference,
+            Transaction.user_id == current_user.id,
+        )
+    )
+    transaction = result.scalar_one_or_none()
+    if transaction is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction introuvable")
+
+    if transaction.payin_status != TransactionStatus.PENDING:
+        return DepositConfirmResponse(
+            internal_reference=transaction.internal_reference,
+            status=transaction.status,
+            message="Cette recharge a déjà été traitée.",
+        )
+
+    try:
+        kkiapay_data = await kkiapay_client.verify_transaction(payload.kkiapay_transaction_id)
+    except kkiapay_client.KkiapayNotConfigured as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - erreur réseau/HTTP vers Kkiapay
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Impossible de vérifier le paiement auprès de Kkiapay pour le moment, réessayez.",
+        ) from exc
+
+    success = kkiapay_client.is_success(kkiapay_data)
+    await finalize_kkiapay_deposit(
+        db, transaction, success=success, kkiapay_transaction_id=payload.kkiapay_transaction_id
+    )
+    await db.commit()
+
+    return DepositConfirmResponse(
+        internal_reference=transaction.internal_reference,
+        status=transaction.status,
+        message="Recharge confirmée !" if success else "Le paiement Kkiapay n'a pas abouti.",
     )
 
 

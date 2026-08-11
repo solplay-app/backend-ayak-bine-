@@ -87,7 +87,21 @@ class DepositRequest(BaseModel):
 class DepositResponse(BaseModel):
     internal_reference: str
     status: TransactionStatus
-    redirect_url: str | None = None
+    amount: Decimal
+    message: str
+    # --- Nécessaire pour ouvrir le widget Kkiapay côté app Flutter ---
+    kkiapay_public_key: str
+    kkiapay_sandbox: bool
+
+
+class DepositConfirmRequest(BaseModel):
+    internal_reference: str
+    kkiapay_transaction_id: str = Field(min_length=1, max_length=100)
+
+
+class DepositConfirmResponse(BaseModel):
+    internal_reference: str
+    status: TransactionStatus
     message: str
 
 
@@ -199,3 +213,26 @@ class JekoWebhookPayload(BaseModel):
     event: str
     data: JekoWebhookTransactionData
     timestamp: str | None = None
+
+
+# ---------- Vérification d'identité (KYC), validation manuelle ----------
+
+class KycSubmitRequest(BaseModel):
+    # Images encodées en base64 par l'app avant l'envoi (voir
+    # kyc_verification_screen.dart côté Flutter). Champ obligatoire :
+    # photo de la pièce d'identité. Selfie optionnel mais recommandé.
+    id_document_base64: str = Field(min_length=100)
+    selfie_base64: str | None = Field(default=None, min_length=100)
+
+
+class KycSubmitResponse(BaseModel):
+    id: uuid.UUID
+    status: str
+    message: str
+
+
+class KycStatusResponse(BaseModel):
+    kyc_status: str  # PENDING / VERIFIED / REJECTED (statut global du compte, sur User)
+    submission_status: str | None = None  # UNDER_REVIEW / VERIFIED / REJECTED (dernière demande, s'il y en a une)
+    rejection_reason: str | None = None
+    submitted_at: datetime | None = None

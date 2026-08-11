@@ -32,8 +32,16 @@ async def create_transfer(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Code PIN incorrect")
 
     source_phone = payload.source_phone or current_user.phone_number
-    if payload.recipient_phone == source_phone:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Le destinataire ne peut pas être votre propre numéro.")
+    # Le transfert vers son propre numéro est désormais autorisé (ex: déplacer
+    # de l'argent de son compte Wave vers son compte Orange Money personnel,
+    # sur des opérateurs différents). On garde uniquement le garde-fou logique :
+    # même numéro ET même opérateur des deux côtés n'a aucun sens (ce serait un
+    # transfert vers soi-même sans aucun changement d'opérateur).
+    if payload.recipient_phone == source_phone and payload.destination_operator == payload.source_operator:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Choisissez un opérateur de destination différent pour transférer vers votre propre numéro.",
+        )
 
     platform_fee = compute_platform_fee(payload.amount)
     total_to_collect = compute_total_to_collect(payload.amount)

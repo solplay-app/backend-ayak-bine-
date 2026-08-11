@@ -5,7 +5,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Numeric, String, func
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -97,3 +97,41 @@ class Transaction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="transactions")
+
+
+class KycSubmission(Base):
+    """
+    Demande de vérification d'identité (KYC), validée manuellement par un
+    admin via app/api/v1/admin.py (pas de prestataire tiers automatique
+    pour l'instant).
+
+    Table volontairement séparée de `users` : ça évite de devoir modifier
+    la table `users` existante en production (pas d'Alembic/migration ici,
+    seulement Base.metadata.create_all au démarrage — qui ne crée que les
+    tables manquantes, jamais de nouvelles colonnes sur une table existante).
+    Une nouvelle table, elle, est créée automatiquement sans aucune action
+    manuelle nécessaire sur Render.
+
+    `status` est une simple chaîne (pas un Enum Postgres natif) pour la même
+    raison : ajouter une valeur à un ENUM Postgres existant nécessite aussi
+    une commande SQL manuelle (ALTER TYPE ... ADD VALUE), qu'on veut éviter ici.
+    """
+    __tablename__ = "kyc_submissions"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+
+    # Images encodées en base64 (pas de stockage objet type S3 configuré sur
+    # ce projet actuellement) : simple et suffisant pour le volume actuel,
+    # mais à migrer vers un stockage dédié si le nombre de demandes grossit
+    # beaucoup (une table Postgres n'est pas l'idéal pour de gros blobs).
+    id_document_base64: Mapped[str] = mapped_column(Text, nullable=False)
+    selfie_base64: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(20), default="UNDER_REVIEW")  # UNDER_REVIEW / VERIFIED / REJECTED
+    rejection_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"] = relationship()
