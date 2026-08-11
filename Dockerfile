@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# kkiapay est installé à part, sans ses dépendances transitives (--no-deps) :
+# voir le commentaire dans requirements.txt pour le pourquoi.
+RUN pip install --no-cache-dir --no-deps kkiapay==0.0.6
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
