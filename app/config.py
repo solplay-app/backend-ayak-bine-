@@ -39,15 +39,24 @@ class Settings(BaseSettings):
     public_base_url: str
 
     # --- Kkiapay (Sandbox temporaire pour la Recharge wallet uniquement) ---
-    # Clés disponibles sur https://app.kkiapay.me/dashboard/developers/keys
+    # Clés API disponibles sur https://app.kkiapay.me/dashboard/developers/keys
     # kkiapay_public_key : utilisée côté app Flutter pour ouvrir le widget de paiement.
-    # kkiapay_private_key + kkiapay_secret : usage serveur uniquement (vérification + webhook).
+    # kkiapay_private_key + kkiapay_secret : usage serveur uniquement, pour le SDK
+    # (vérification de transaction). ⚠️ kkiapay_secret (clé API "secret") est
+    # DIFFÉRENTE de kkiapay_webhook_secret ci-dessous : ce sont deux clés
+    # distinctes sur des pages différentes du dashboard Kkiapay, à ne pas confondre.
     # NE PAS utiliser pour Transférer/Retirer : Kkiapay n'a pas d'API de versement
     # instantané vers un destinataire arbitraire (voir app/services/kkiapay_client.py).
     kkiapay_public_key: str | None = None
     kkiapay_private_key: str | None = None
     kkiapay_secret: str | None = None
     kkiapay_sandbox: bool = True
+
+    # Hash secret défini dans Developers > API Keys > Webhook sur le dashboard
+    # Kkiapay, lors de la création du webhook (URL /api/v1/webhooks/kkiapay).
+    # Sert UNIQUEMENT à vérifier l'en-tête x-kkiapay-secret des webhooks entrants
+    # — ce n'est PAS la même valeur que kkiapay_secret ci-dessus.
+    kkiapay_webhook_secret: str | None = None
 
     # --- KYC (taille max d'une image encodée en base64, ~4MB de photo réelle) ---
     kyc_max_image_base64_chars: int = 6_000_000
