@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -8,6 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1 import admin, auth, devices, kyc, transfers, wallet, webhooks
 from app.database import Base, engine, get_redis
 from app.services.jeko_client import get_jeko_client
+
+# Sans ceci, le logger racine reste au niveau WARNING par défaut : tous les
+# logger.info(...) de l'app (otp_service, sms.console, sms.twilio, ...) sont
+# silencieusement ignorés. Seuls les logs d'accès d'uvicorn (health, requêtes
+# HTTP) apparaissent, car uvicorn configure ses propres loggers séparément.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
 @asynccontextmanager
