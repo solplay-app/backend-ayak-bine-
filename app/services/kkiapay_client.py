@@ -71,11 +71,13 @@ def is_definitively_failed(kkiapay_data: dict) -> bool:
 def verify_webhook_secret(received_secret: str | None) -> bool:
     """
     Kkiapay signe ses webhooks via l'en-tête `x-kkiapay-secret`, qui doit
-    correspondre exactement au secret configuré sur le dashboard Kkiapay
-    (pas un HMAC à calculer, une simple égalité — voir leur documentation
-    webhook officielle).
+    correspondre exactement au HASH SECRET défini sur le dashboard Kkiapay,
+    dans Developers > API Keys > Webhook (PAS le "secret" des clés API
+    utilisé pour le SDK — ce sont deux valeurs différentes).
+    Pas un HMAC à calculer, une simple égalité — voir leur documentation
+    webhook officielle.
     """
     settings = get_settings()
-    if not settings.kkiapay_secret or not received_secret:
+    if not settings.kkiapay_webhook_secret or not received_secret:
         return False
-    return hmac.compare_digest(received_secret, settings.kkiapay_secret)
+    return hmac.compare_digest(received_secret, settings.kkiapay_webhook_secret)
