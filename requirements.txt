@@ -4,11 +4,12 @@ pydantic==2.9.2
 pydantic-settings==2.5.2
 SQLAlchemy==2.0.35
 asyncpg==0.29.0
+psycopg2-binary==2.9.9
 alembic==1.13.3
 httpx==0.27.2
 redis==5.0.8
 python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
+
 # Épingle explicite requise : passlib 1.7.4 effectue un auto-test interne au
 # premier appel pour détecter la version du backend bcrypt, en hashant une
 # chaîne de test qui dépasse 72 octets. Les versions bcrypt >= 4.1 sont
@@ -16,14 +17,8 @@ passlib[bcrypt]==1.7.4
 # silencieuse comme avant), ce qui fait planter CE test interne — même pour
 # un simple code PIN à 4 chiffres qui, lui, ne dépasse jamais 72 octets.
 # Voir : https://github.com/pyca/bcrypt/issues/684
+passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
+
 python-multipart==0.0.9
 tenacity==9.0.0
-google-auth==2.35.0
-requests>=2.31,<3
-# kkiapay==0.0.6 est installé séparément dans le Dockerfile avec --no-deps :
-# sa contrainte transitive sur `requests` (très ancienne, ~2.22.0) est
-# incompatible avec la version moderne de urllib3 installée, ce qui casse
-# `requests` au runtime (ModuleNotFoundError: urllib3.packages.six.moves)
-# et par ricochet google-auth (utilisé par le service de notifications push).
-# --no-deps empêche cette contrainte d'influencer la résolution globale.
