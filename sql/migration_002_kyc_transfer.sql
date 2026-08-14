@@ -34,6 +34,16 @@ CREATE TABLE IF NOT EXISTS kyc_submissions (
     updated_at           TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Si kyc_submissions existait déjà (créée hors de ce script, avec une
+-- structure différente/incomplète), le CREATE TABLE IF NOT EXISTS
+-- ci-dessus ne la modifie pas. On complète donc les colonnes manquantes
+-- une par une, sans jamais toucher aux colonnes déjà présentes.
+ALTER TABLE kyc_submissions ADD COLUMN IF NOT EXISTS selfie_base64      TEXT;
+ALTER TABLE kyc_submissions ADD COLUMN IF NOT EXISTS reviewed_by        UUID REFERENCES users(id);
+ALTER TABLE kyc_submissions ADD COLUMN IF NOT EXISTS review_note        TEXT;
+ALTER TABLE kyc_submissions ADD COLUMN IF NOT EXISTS created_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+ALTER TABLE kyc_submissions ADD COLUMN IF NOT EXISTS updated_at         TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
+
 -- Un seul dossier "actif" (PENDING ou APPROVED) par utilisateur à la fois.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_kyc_active_per_user
     ON kyc_submissions(user_id)
