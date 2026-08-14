@@ -1,126 +1,38 @@
 """
-Route de réconciliation manuelle utilisable SANS Shell (contournement pour
-le plan gratuit Render, où le Shell est désactivé : "Shell is not supported
-for free instance types").
+Pages admin utilisables SANS Shell (le plan gratuit Render désactive le
+Shell) : consultation et validation manuelle, via de simples URL protégées
+par un secret, collées dans le navigateur.
 
-Fonctionne en collant simplement une URL dans le navigateur, protégée par un
-mot de passe secret (`ADMIN_RECONCILE_SECRET`, à définir dans Render ->
-onglet "Environment", PAS besoin de Shell pour ça).
-
-⚠️ Cette route reste un GET (plus simple à utiliser depuis un navigateur)
-mais peut déclencher un vrai versement d'argent (--apply). Elle est donc
-protégée par un secret long et aléatoire, et n'agit QUE sur une transaction
-précise passée en paramètre — jamais en masse.
+Protégé par ADMIN_BOOTSTRAP_SECRET (déjà défini sur Render pour la création
+du premier compte admin — réutilisé ici pour éviter une variable de plus).
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
-from app.services.jeko_client import JekoClient, get_jeko_client
-from app.services.reconciliation import (
-    TransactionNotFoundForReconciliation,
-    reconcile_transaction_by_reference,
-)
+from app.models import KycStatus, KycSubmission, LedgerTransaction, TransactionStatus, User, Wallet
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
 settings = get_settings()
 
 
 def _check_secret(secret: str) -> None:
-    if not settings.admin_reconcile_secret:
+    if not settings.ADMIN_BOOTSTRAP_SECRET:
         # Route jamais activée si le secret n'a pas été configuré côté Render :
         # évite qu'un déploiement oublié laisse la route ouverte à tout le monde.
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Route admin non configurée.")
-    if secret != settings.admin_reconcile_secret:
+    if secret != settings.ADMIN_BOOTSTRAP_SECRET:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Secret invalide.")
 
 
-@router.get("/reconcile-transaction")
-async def reconcile_transaction(
-    secret: str = Query(..., description="Doit correspondre à ADMIN_RECONCILE_SECRET"),
-    reference: str = Query(..., description="Référence interne, ex: TRF-ABCD1234"),
-    apply: bool = Query(False, description="false = dry-run (rien n'est modifié), true = applique réellement"),
-    db: AsyncSession = Depends(get_db),
-    jeko: JekoClient = Depends(get_jeko_client),
-):
-    """
-    Vérifie le vrai statut d'une transaction auprès de JEKO et, si `apply=true`,
-    rejoue le traitement qu'aurait dû faire le webhook manqué (déclenche le
-    pay-out en attente, ou recrédite le wallet si le pay-out a échoué).
-
-    Utilisation (coller dans le navigateur) :
-      https://TON-SERVICE.onrender.com/api/v1/admin/reconcile-transaction?secret=...&reference=TRF-XXXX
-      https://TON-SERVICE.onrender.com/api/v1/admin/reconcile-transaction?secret=...&reference=TRF-XXXX&apply=true
-    """
-    _check_secret(secret)
-
-    try:
-        return await reconcile_transaction_by_reference(db, jeko, reference, apply=apply)
-    except TransactionNotFoundForReconciliation:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Transaction '{reference}' introuvable.")
-
-
-@router.get("/user-history")
-async def user_transaction_history(
-    secret: str = Query(...),
-    reference: str = Query(..., description="N'importe quelle référence interne d'une transaction de ce client, ex: TRF-FE7064473D0B44F2"),
-    db: AsyncSession = Depends(get_db),
-):
-    """
-    Retrouve le client propriétaire d'une transaction donnée, puis liste
-    TOUT son historique (avec le solde wallet actuel), pour vérifier
-    précisément d'où vient un solde donné (utile après une réconciliation
-    manuelle, pour confirmer qu'un montant recrédité correspond bien à ce
-    qui était attendu).
-
-    Utilisation (coller dans le navigateur) :
-      https://TON-SERVICE.onrender.com/api/v1/admin/user-history?secret=...&reference=TRF-XXXX
-    """
-    _check_secret(secret)
-
-    from sqlalchemy import select
-
-    from app.models.models import Transaction, Wallet
-
-    result = await db.execute(select(Transaction).where(Transaction.internal_reference == reference))
-    anchor_transaction = result.scalar_one_or_none()
-    if anchor_transaction is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Transaction '{reference}' introuvable.")
-
-    user_id = anchor_transaction.user_id
-
-    wallet_result = await db.execute(select(Wallet).where(Wallet.user_id == user_id))
-    wallet = wallet_result.scalar_one_or_none()
-
-    history_result = await db.execute(
-        select(Transaction).where(Transaction.user_id == user_id).order_by(Transaction.created_at.asc())
-    )
-    transactions = history_result.scalars().all()
-
-    return {
-        "user_id": str(user_id),
-        "current_wallet_balance": str(wallet.balance) if wallet else None,
-        "transaction_count": len(transactions),
-        "history": [
-            {
-                "internal_reference": t.internal_reference,
-                "type": t.type.value,
-                "amount": str(t.amount),
-                "fee": str(t.fee),
-                "total_collected": str(t.total_collected) if t.total_collected is not None else None,
-                "status": t.status.value,
-                "payin_status": t.payin_status.value if t.payin_status else None,
-                "payout_status": t.payout_status.value if t.payout_status else None,
-                "recipient_phone": t.recipient_phone,
-                "created_at": t.created_at.isoformat(),
-            }
-            for t in transactions
-        ],
-    }
+# ---------------------------- Transactions -------------------------------
 
 @router.get("/pending-transactions")
 async def list_pending_transactions(
@@ -128,31 +40,87 @@ async def list_pending_transactions(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Liste les références des transactions encore PENDING, pour éviter de
-    devoir passer par le Shell juste pour les retrouver.
+    Liste les transactions encore PENDING (pay-in déclarés en attente de
+    validation, pay-out en attente de traitement), pour éviter de devoir
+    passer par le Shell juste pour les retrouver.
 
     Utilisation (coller dans le navigateur) :
       https://TON-SERVICE.onrender.com/api/v1/admin/pending-transactions?secret=...
     """
     _check_secret(secret)
 
-    from sqlalchemy import select
-
-    from app.models.models import Transaction, TransactionStatus
-
-    result = await db.execute(select(Transaction).where(Transaction.status == TransactionStatus.PENDING))
+    result = await db.execute(
+        select(LedgerTransaction)
+        .where(LedgerTransaction.status == TransactionStatus.PENDING)
+        .order_by(LedgerTransaction.created_at.asc())
+    )
     transactions = result.scalars().all()
     return [
         {
-            "internal_reference": t.internal_reference,
+            "reference": t.reference,
             "type": t.type.value,
+            "provider": t.provider.value,
             "amount": str(t.amount),
-            "payin_status": t.payin_status.value if t.payin_status else None,
-            "payout_status": t.payout_status.value if t.payout_status else None,
+            "fee": str(t.fee),
+            "phone_number": t.phone_number,
+            "proof_ref": t.proof_ref,
             "created_at": t.created_at.isoformat(),
         }
         for t in transactions
     ]
+
+
+@router.get("/user-history")
+async def user_transaction_history(
+    secret: str = Query(...),
+    reference: str = Query(..., description="N'importe quelle référence interne d'une transaction de ce client, ex: PI-ABCD1234"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retrouve le client propriétaire d'une transaction donnée, puis liste
+    tout son historique (avec le solde wallet actuel).
+
+    Utilisation (coller dans le navigateur) :
+      https://TON-SERVICE.onrender.com/api/v1/admin/user-history?secret=...&reference=PI-XXXX
+    """
+    _check_secret(secret)
+
+    anchor = (
+        await db.execute(select(LedgerTransaction).where(LedgerTransaction.reference == reference))
+    ).scalar_one_or_none()
+    if anchor is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Transaction '{reference}' introuvable.")
+
+    user = (await db.execute(select(User).where(User.id == anchor.user_id))).scalar_one_or_none()
+    wallet = (await db.execute(select(Wallet).where(Wallet.user_id == anchor.user_id))).scalar_one_or_none()
+
+    history = (
+        await db.execute(
+            select(LedgerTransaction)
+            .where(LedgerTransaction.user_id == anchor.user_id)
+            .order_by(LedgerTransaction.created_at.asc())
+        )
+    ).scalars().all()
+
+    return {
+        "user_id": str(anchor.user_id),
+        "user_phone": user.phone_number if user else None,
+        "current_wallet_balance": str(wallet.balance) if wallet else None,
+        "transaction_count": len(history),
+        "history": [
+            {
+                "reference": t.reference,
+                "type": t.type.value,
+                "provider": t.provider.value,
+                "amount": str(t.amount),
+                "fee": str(t.fee),
+                "status": t.status.value,
+                "phone_number": t.phone_number,
+                "created_at": t.created_at.isoformat(),
+            }
+            for t in history
+        ],
+    }
 
 
 # ---------- Vérification d'identité (KYC) — validation manuelle ----------
@@ -161,23 +129,19 @@ async def list_pending_transactions(
 async def kyc_pending_page(secret: str = Query(...), db: AsyncSession = Depends(get_db)):
     """
     Page HTML (pas du JSON brut, exprès) listant les demandes KYC en attente,
-    avec les photos affichées directement — pour pouvoir les regarder et
-    décider sans outil externe. Chaque demande a un bouton Valider / Rejeter.
+    avec les photos affichées directement. Chaque demande a un bouton
+    Valider / Rejeter.
 
     Utilisation (coller dans le navigateur) :
       https://TON-SERVICE.onrender.com/api/v1/admin/kyc/pending?secret=...
     """
     _check_secret(secret)
 
-    from sqlalchemy import select
-
-    from app.models.models import KycSubmission, User
-
     result = await db.execute(
         select(KycSubmission, User)
         .join(User, User.id == KycSubmission.user_id)
-        .where(KycSubmission.status == "UNDER_REVIEW")
-        .order_by(KycSubmission.submitted_at.asc())
+        .where(KycSubmission.status == KycStatus.PENDING)
+        .order_by(KycSubmission.created_at.asc())
     )
     rows = result.all()
 
@@ -194,7 +158,7 @@ async def kyc_pending_page(secret: str = Query(...), db: AsyncSession = Depends(
             cards.append(f"""
             <div style="border:1px solid #ddd;border-radius:12px;padding:16px;margin-bottom:24px;">
               <h3 style="margin:0 0 4px 0;">{user.full_name} — {user.phone_number}</h3>
-              <p style="color:#888;margin:0 0 12px 0;font-size:13px;">Demande envoyée le {submission.submitted_at.strftime('%d/%m/%Y à %H:%M')}</p>
+              <p style="color:#888;margin:0 0 12px 0;font-size:13px;">Demande envoyée le {submission.created_at.strftime('%d/%m/%Y à %H:%M')}</p>
               <div style="display:flex;flex-wrap:wrap;">
                 <img src="data:image/jpeg;base64,{submission.id_document_base64}" style="max-width:280px;border-radius:8px;" />
                 {selfie_html}
@@ -229,39 +193,32 @@ async def kyc_decide(
 ):
     """
     Applique la décision (clic depuis /admin/kyc/pending, ou URL collée
-    directement). Idempotent : si la demande n'est plus UNDER_REVIEW
-    (déjà traitée), ne fait rien.
+    directement). Idempotent : si la demande n'est plus PENDING (déjà
+    traitée), ne fait rien.
     """
     _check_secret(secret)
 
-    from sqlalchemy import select
-
-    from app.models.models import KycStatus, KycSubmission, User
-
-    result = await db.execute(select(KycSubmission).where(KycSubmission.id == submission_id))
-    submission = result.scalar_one_or_none()
+    submission = (
+        await db.execute(select(KycSubmission).where(KycSubmission.id == submission_id))
+    ).scalar_one_or_none()
     if submission is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Demande introuvable.")
 
-    if submission.status != "UNDER_REVIEW":
-        return HTMLResponse(f"<p>Cette demande a déjà été traitée (statut actuel : {submission.status}).</p>")
+    if submission.status != KycStatus.PENDING:
+        return HTMLResponse(f"<p>Cette demande a déjà été traitée (statut actuel : {submission.status.value}).</p>")
 
-    user_result = await db.execute(select(User).where(User.id == submission.user_id))
-    user = user_result.scalar_one()
-
-    from datetime import datetime, timezone
+    user = (await db.execute(select(User).where(User.id == submission.user_id))).scalar_one()
 
     if decision == "approve":
-        submission.status = "VERIFIED"
-        user.kyc_status = KycStatus.VERIFIED
+        submission.status = KycStatus.APPROVED
+        submission.review_note = None
         message = f"✅ Compte de {user.full_name} vérifié avec succès."
     else:
-        submission.status = "REJECTED"
-        submission.rejection_reason = reason or "Document non conforme"
-        user.kyc_status = KycStatus.REJECTED
-        message = f"❌ Demande de {user.full_name} rejetée ({submission.rejection_reason}). Le client peut renvoyer de nouveaux documents."
+        submission.status = KycStatus.REJECTED
+        submission.review_note = reason or "Document non conforme"
+        message = f"❌ Demande de {user.full_name} rejetée ({submission.review_note}). Le client peut renvoyer de nouveaux documents."
 
-    submission.reviewed_at = datetime.now(timezone.utc)
+    submission.updated_at = datetime.now(timezone.utc)
     await db.commit()
 
     return HTMLResponse(f"<p>{message}</p><p><a href='/api/v1/admin/kyc/pending?secret={secret}'>← Retour aux demandes en attente</a></p>")
