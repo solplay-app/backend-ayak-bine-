@@ -11,7 +11,6 @@ from app.api_auth import router as auth_router
 from app.api_devices import router as devices_router
 from app.api_kyc import router as kyc_router
 from app.api_wallet import router as wallet_router
-from app.api_webhooks import router as webhooks_router
 from app.config import get_settings
 from app.database import _sync_engine
 from app.db_migrate import run_migrations
@@ -57,7 +56,6 @@ async def health():
 
 app.include_router(auth_router)
 app.include_router(wallet_router)
-app.include_router(webhooks_router)
 app.include_router(admin_router)
 app.include_router(kyc_router)
 app.include_router(devices_router)
