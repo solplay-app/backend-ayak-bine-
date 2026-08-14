@@ -1,73 +1,46 @@
-from __future__ import annotations
-
+"""Point d'entrée FastAPI."""
 import logging
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
 
-from app.api.v1 import admin, auth, devices, kyc, transfers, wallet, webhooks
-from app.database import Base, engine, get_redis
-from app.models.models import KycStatus, MobileOperator, TransactionStatus, TransactionType
-from app.services.jeko_client import get_jeko_client
+from app.api_admin import router as admin_router
+from app.api_auth import router as auth_router
+from app.api_devices import router as devices_router
+from app.api_kyc import router as kyc_router
+from app.api_wallet import router as wallet_router
+from app.api_webhooks import router as webhooks_router
+from app.config import get_settings
+from app.database import _sync_engine
+from app.db_migrate import run_migrations
 
-# Sans ceci, le logger racine reste au niveau WARNING par défaut : tous les
-# logger.info(...) de l'app (otp_service, sms.console, sms.twilio, ...) sont
-# silencieusement ignorés. Seuls les logs d'accès d'uvicorn (health, requêtes
-# HTTP) apparaissent, car uvicorn configure ses propres loggers séparément.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
 logger = logging.getLogger("startup")
 
-# Mapping nom du type Postgres -> Enum Python correspondant (voir app/models/models.py).
-# Sert à combler automatiquement les valeurs manquantes côté base au démarrage,
-# indispensable sur le plan gratuit Render qui ne donne pas accès au Shell/psql.
-_PG_ENUMS = {
-    "transaction_type": TransactionType,
-    "transaction_status": TransactionStatus,
-    "mobile_operator": MobileOperator,
-    "kyc_status": KycStatus,
-}
-
-
-async def _sync_enum_values(conn) -> None:
-    """
-    create_all() ne modifie JAMAIS un type enum Postgres déjà existant : si un
-    membre est ajouté à un Enum Python après coup (ex: TransactionType.DEPOSIT),
-    la base ne le connaît pas tant qu'on ne fait pas explicitement
-    ALTER TYPE ... ADD VALUE. Sans accès Shell (plan gratuit Render), on le fait
-    ici, au démarrage de l'app, plutôt que via psql.
-    """
-    for pg_type_name, py_enum in _PG_ENUMS.items():
-        for member in py_enum:
-            # ADD VALUE IF NOT EXISTS : idempotent, ne casse rien si déjà présent.
-            await conn.execute(text(f"ALTER TYPE {pg_type_name} ADD VALUE IF NOT EXISTS '{member.value}'"))
-            logger.info("Enum %s: valeur '%s' vérifiée/ajoutée", pg_type_name, member.value)
+settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Crée automatiquement les tables manquantes (ex: kyc_submissions) au
-    # démarrage — sans ça il faudrait un accès Shell (indisponible sur le
-    # plan gratuit Render) pour créer la nouvelle table manuellement.
-    # Sans danger pour les tables déjà existantes : create_all ne touche
-    # jamais une table qui existe déjà, ni ses colonnes.
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    # Transaction séparée : depuis Postgres 12, ALTER TYPE ... ADD VALUE
-    # fonctionne dans un bloc transactionnel classique (plus besoin d'autocommit).
-    async with engine.begin() as conn:
-        await _sync_enum_values(conn)
-
+    logger.info("Démarrage Ayak'bine Wallet — host=%s port=%s", settings.APP_HOST, settings.APP_PORT)
+    try:
+        run_migrations(_sync_engine)
+        logger.info("Migrations SQL à jour.")
+    except Exception:
+        logger.exception("Échec de l'application des migrations SQL — arrêt du service.")
+        raise
     yield
-    redis = get_redis()
-    await redis.close()
-    await get_jeko_client().close()
 
 
-app = FastAPI(title="Ayak'bine Backend", version="2.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="Ayak'bine Virtual Wallet",
+    version="1.1.0",
+    description="Backend FastAPI pour Pay-In / Pay-Out via Virtual Ledger.",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -79,13 +52,17 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "service": "ayak-wallet"}
 
 
-app.include_router(auth.router)
-app.include_router(wallet.router)
-app.include_router(transfers.router)
-app.include_router(webhooks.router)
-app.include_router(devices.router)
-app.include_router(admin.router)
-app.include_router(kyc.router)
+app.include_router(auth_router)
+app.include_router(wallet_router)
+app.include_router(webhooks_router)
+app.include_router(admin_router)
+app.include_router(kyc_router)
+app.include_router(devices_router)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host=settings.APP_HOST, port=settings.APP_PORT, reload=True)
