@@ -1,60 +1,89 @@
+"""/register et /login USER + /admin/bootstrap."""
 from fastapi import APIRouter, Depends, HTTPException, status
-from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import create_access_token, get_current_user, hash_pin
-from app.database import get_db, get_redis
-from app.models.models import KycStatus, User, Wallet
-from app.schemas.schemas import AuthTokenResponse, RequestOtpRequest, SetPinRequest, UserRead, VerifyOtpRequest
-from app.services.otp_service import OtpDeliveryFailed, OtpInvalid, OtpRateLimited, generate_and_send_otp, verify_otp
-from app.services.sms import SmsProvider, get_sms_provider
+from app.auth import create_access_token, get_current_user, hash_pin, verify_pin
+from app.config import get_settings
+from app.database import get_db
+from app.models import User, UserRole, Wallet
+from app.schemas import BootstrapAdminRequest, LoginRequest, RegisterRequest, TokenResponse, UserMeResponse
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentification"])
-_UNSET_PIN_MARKER = "UNSET"
+settings = get_settings()
 
 
-@router.post("/request-otp", status_code=status.HTTP_204_NO_CONTENT)
-async def request_otp(payload: RequestOtpRequest, redis: Redis = Depends(get_redis), sms: SmsProvider = Depends(get_sms_provider)):
-    try:
-        await generate_and_send_otp(redis, payload.phone_number, sms)
-    except OtpRateLimited as exc:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
-    except OtpDeliveryFailed as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+@router.get("/me", response_model=UserMeResponse)
+async def get_me(user: User = Depends(get_current_user)):
+    """Retourne les informations du compte actuellement connecté."""
+    return UserMeResponse(
+        id=user.id,
+        phone_number=user.phone_number,
+        full_name=user.full_name,
+        role=user.role.value,
+        created_at=user.created_at,
+    )
 
 
-@router.post("/verify-otp", response_model=AuthTokenResponse)
-async def verify_otp_endpoint(payload: VerifyOtpRequest, db: AsyncSession = Depends(get_db), redis: Redis = Depends(get_redis)):
-    try:
-        await verify_otp(redis, payload.phone_number, payload.otp_code)
-    except OtpInvalid as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    existing = (await db.execute(select(User).where(User.phone_number == payload.phone_number))).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=400, detail="Numéro déjà enregistré")
 
-    result = await db.execute(select(User).where(User.phone_number == payload.phone_number))
-    user = result.scalar_one_or_none()
-
-    pin_required = False
-    if user is None:
-        user = User(full_name=payload.full_name or "Utilisateur", phone_number=payload.phone_number, pin_code_hash=_UNSET_PIN_MARKER, kyc_status=KycStatus.PENDING)
-        db.add(user)
-        await db.flush()
-        db.add(Wallet(user_id=user.id, balance=0))
-        pin_required = True
-    elif user.pin_code_hash == _UNSET_PIN_MARKER:
-        pin_required = True
-
+    user = User(
+        phone_number=payload.phone_number,
+        full_name=payload.full_name or "Utilisateur",
+        pin_code_hash=hash_pin(payload.pin_code),
+        role=UserRole.USER,
+    )
+    db.add(user)
+    await db.flush()
+    db.add(Wallet(user_id=user.id))
     await db.commit()
-    token = create_access_token(str(user.id))
-    return AuthTokenResponse(access_token=token, pin_required=pin_required)
+    await db.refresh(user)
+
+    token = create_access_token(str(user.id), user.role.value)
+    return TokenResponse(access_token=token, role=user.role.value)
 
 
-@router.get("/me", response_model=UserRead)
-async def get_me(current_user: User = Depends(get_current_user)):
-    return current_user
+@router.post("/login", response_model=TokenResponse)
+async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+    user = (await db.execute(select(User).where(User.phone_number == payload.phone_number))).scalar_one_or_none()
+    if not user or not verify_pin(payload.pin_code, user.pin_code_hash):
+        raise HTTPException(status_code=401, detail="Identifiants invalides")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Compte désactivé")
+    token = create_access_token(str(user.id), user.role.value)
+    return TokenResponse(access_token=token, role=user.role.value)
 
 
-@router.post("/set-pin", status_code=status.HTTP_204_NO_CONTENT)
-async def set_pin(payload: SetPinRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    current_user.pin_code_hash = hash_pin(payload.pin_code)
+@router.post("/admin/bootstrap", response_model=TokenResponse)
+async def bootstrap_admin(payload: BootstrapAdminRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Crée le premier administrateur — utilisable UNE seule fois.
+    Sécurisé par ADMIN_BOOTSTRAP_SECRET, à changer ensuite
+    (= vidage complet par script ou ALTER USER).
+    """
+    if payload.bootstrap_secret != settings.ADMIN_BOOTSTRAP_SECRET:
+        raise HTTPException(status_code=403, detail="Secret de bootstrap invalide")
+
+    existing_admin = (
+        await db.execute(select(User).where(User.role == UserRole.ADMIN))
+    ).scalar_one_or_none()
+    if existing_admin:
+        raise HTTPException(status_code=409, detail="Un admin existe déjà — bootstrap fermé")
+
+    admin = User(
+        phone_number=payload.admin_phone,
+        full_name="Administrateur",
+        pin_code_hash=hash_pin(payload.admin_pin),
+        role=UserRole.ADMIN,
+    )
+    db.add(admin)
+    await db.flush()
+    db.add(Wallet(user_id=admin.id))
     await db.commit()
+
+    token = create_access_token(str(admin.id), admin.role.value)
+    return TokenResponse(access_token=token, role=admin.role.value)
