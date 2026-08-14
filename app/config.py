@@ -1,99 +1,31 @@
+"""Configuration chargée depuis .env (pydantic-settings v2)."""
 from functools import lru_cache
-from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 
-    # Base de données
-    database_url: str
-    redis_url: str = "redis://localhost:6379/0"
+    DATABASE_URL: str
 
-    @field_validator("database_url")
-    @classmethod
-    def _force_asyncpg_driver(cls, v: str) -> str:
-        # Render (et d'autres hébergeurs) fournissent DATABASE_URL au format
-        # "postgres://..." ou "postgresql://..." (driver sync par défaut).
-        # SQLAlchemy async a besoin explicitement du driver asyncpg.
-        if v.startswith("postgres://"):
-            v = v.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif v.startswith("postgresql://") and "+asyncpg" not in v:
-            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return v
+    JWT_SECRET_KEY: str
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = 43200  # 30 jours
 
-    # Sécurité applicative
-    jwt_secret_key: str
-    jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 60
+    ADMIN_BOOTSTRAP_SECRET: str
 
-    # JEKO Africa (voir https://developer.jeko.africa)
-    # Authentification réelle JEKO : deux en-têtes distincts, PAS un Bearer token.
-    jeko_base_url: str = "https://api.jeko.africa"
-    jeko_api_key: str
-    jeko_api_key_id: str
-    jeko_store_id: str  # storeId JEKO — obligatoire sur presque tous les endpoints
-    jeko_webhook_secret: str
-    jeko_timeout_seconds: int = 15
+    WEBHOOK_SECRET: str
+    SMS_LISTENER_TOKEN: str
 
-    public_base_url: str
+    WAVE_MERCHANT_PHONE: str = "+221770000000"
+    WAVE_MERCHANT_NAME: str = "Ayak'bine Wave"
+    ORANGE_MERCHANT_PHONE: str = "+221780000000"
+    ORANGE_MERCHANT_NAME: str = "Ayak'bine Orange"
 
-    # --- Kkiapay (Sandbox temporaire pour la Recharge wallet uniquement) ---
-    # Clés API disponibles sur https://app.kkiapay.me/dashboard/developers/keys
-    # kkiapay_public_key : utilisée côté app Flutter pour ouvrir le widget de paiement.
-    # kkiapay_private_key + kkiapay_secret : usage serveur uniquement, pour le SDK
-    # (vérification de transaction). ⚠️ kkiapay_secret (clé API "secret") est
-    # DIFFÉRENTE de kkiapay_webhook_secret ci-dessous : ce sont deux clés
-    # distinctes sur des pages différentes du dashboard Kkiapay, à ne pas confondre.
-    # NE PAS utiliser pour Transférer/Retirer : Kkiapay n'a pas d'API de versement
-    # instantané vers un destinataire arbitraire (voir app/services/kkiapay_client.py).
-    kkiapay_public_key: str | None = None
-    kkiapay_private_key: str | None = None
-    kkiapay_secret: str | None = None
-    kkiapay_sandbox: bool = True
+    APP_HOST: str = "0.0.0.0"
+    APP_PORT: int = 8000
 
-    # Hash secret défini dans Developers > API Keys > Webhook sur le dashboard
-    # Kkiapay, lors de la création du webhook (URL /api/v1/webhooks/kkiapay).
-    # Sert UNIQUEMENT à vérifier l'en-tête x-kkiapay-secret des webhooks entrants
-    # — ce n'est PAS la même valeur que kkiapay_secret ci-dessus.
-    kkiapay_webhook_secret: str | None = None
-
-    # --- KYC (taille max d'une image encodée en base64, ~4MB de photo réelle) ---
-    kyc_max_image_base64_chars: int = 6_000_000
-
-    # --- SMS (OTP) ---
-    sms_provider: str = "console"  # console | twilio | orange
-    sms_timeout_seconds: int = 10
-
-    # Twilio
-    twilio_account_sid: str | None = None
-    twilio_auth_token: str | None = None
-    twilio_from_number: str | None = None
-
-    # Orange SMS API (prioritaire pour la Côte d'Ivoire / UEMOA)
-    orange_client_id: str | None = None
-    orange_client_secret: str | None = None
-    orange_sender_address: str | None = None  # ex: "tel:+2250000000"
-    orange_sender_name: str | None = None
-
-    # --- Admin (réconciliation manuelle sans Shell, plan gratuit Render) ---
-    # Doit être défini en variable d'environnement Render (onglet "Environment",
-    # PAS besoin de Shell). Si absent, la route /admin/reconcile-transaction
-    # refuse tout accès (403), donc pas de risque à laisser le code déployé.
-    admin_reconcile_secret: str | None = None
-
-    # --- Notifications push (Firebase Cloud Messaging) ---
-    # `firebase_project_id` : l'ID du projet Firebase (ex: "ayak-bine"),
-    # visible dans Firebase Console > Paramètres du projet > Général.
-    # `firebase_service_account_json` : le CONTENU COMPLET (pas un chemin de
-    # fichier) du fichier JSON de compte de service Firebase, collé tel quel
-    # dans la variable d'environnement. Généré depuis Firebase Console >
-    # Paramètres du projet > Comptes de service > "Générer une nouvelle clé
-    # privée". Si l'un des deux est absent, les push sont simplement
-    # désactivés (mode dégradé silencieux) : l'app continue de fonctionner
-    # via le polling déjà en place côté écran de statut.
-    firebase_project_id: str | None = None
-    firebase_service_account_json: str | None = None
+    KYC_MAX_IMAGE_BASE64_CHARS: int = 6_000_000
 
 
 @lru_cache
