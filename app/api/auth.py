@@ -9,7 +9,7 @@ from app.database import get_db
 from app.models import User, UserRole, Wallet
 from app.schemas import BootstrapAdminRequest, LoginRequest, RegisterRequest, TokenResponse, UserMeResponse
 
-router = APIRouter(prefix="/api/v1/auth", tags=["Authentification"])
+router = APIRouter(prefix="/api/auth", tags=["Authentification"])
 settings = get_settings()
 
 
