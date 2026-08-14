@@ -2,14 +2,27 @@
 -- Migration 002 — KYC + Transfert interne (endpoints manquants côté app)
 -- À exécuter APRÈS sql/schema.sql (ajouts additifs, ne modifie rien
 -- d'existant).
+-- Idempotente : peut être exécutée plusieurs fois / rejouée sur une base
+-- où le type/table/index existeraient déjà (ex: créés hors de ce script)
+-- sans provoquer d'erreur DuplicateObject qui bloquerait le déploiement.
 -- =====================================================================
 
 -- ---------------------------------------------------------------------
 -- 1) Vérification d'identité (KYC)
 -- ---------------------------------------------------------------------
-CREATE TYPE kyc_status AS ENUM ('PENDING', 'APPROVED', 'REJECTED');
+-- CREATE TYPE ne supporte pas IF NOT EXISTS en PostgreSQL : on protège
+-- donc la création via un bloc DO qui ignore l'erreur si le type existe
+-- déjà (cas d'une base où il aurait été créé hors de ce script).
+DO $$
+BEGIN
+    CREATE TYPE kyc_status AS ENUM ('PENDING', 'APPROVED', 'REJECTED');
+EXCEPTION
+    WHEN duplicate_object THEN
+        NULL;
+END
+$$;
 
-CREATE TABLE kyc_submissions (
+CREATE TABLE IF NOT EXISTS kyc_submissions (
     id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     id_document_base64   TEXT NOT NULL,
@@ -22,11 +35,11 @@ CREATE TABLE kyc_submissions (
 );
 
 -- Un seul dossier "actif" (PENDING ou APPROVED) par utilisateur à la fois.
-CREATE UNIQUE INDEX uq_kyc_active_per_user
+CREATE UNIQUE INDEX IF NOT EXISTS uq_kyc_active_per_user
     ON kyc_submissions(user_id)
     WHERE status IN ('PENDING', 'APPROVED');
 
-CREATE INDEX idx_kyc_status ON kyc_submissions(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_kyc_status ON kyc_submissions(status, created_at DESC);
 
 -- ---------------------------------------------------------------------
 -- 2) Transfert interne (wallet à wallet, entre utilisateurs Ayak'bine)
