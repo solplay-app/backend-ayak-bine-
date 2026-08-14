@@ -1,182 +1,204 @@
-"""Service métier bas niveau pour le wallet et les transactions utilisateur."""
+"""Logique métier du portefeuille : utilise les fonctions SQL atomiques."""
 from __future__ import annotations
-
+import json
 import uuid
-from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import AsyncIterator
+from typing import Any
 
-from redis.asyncio import Redis
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from app.models.models import MobileOperator, Transaction, TransactionStatus, TransactionType, Wallet
-
-LOCK_TTL_SECONDS = 15
+import uuid as _uuid
 
 
-class WalletLockError(Exception):
-    pass
+def generate_reference(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
 
 
-class InsufficientBalanceError(Exception):
-    pass
-
-
-def generate_internal_reference(prefix: str) -> str:
-    return f"{prefix}-{uuid.uuid4().hex[:16].upper()}"
-
-
-@asynccontextmanager
-async def user_redis_lock(redis: Redis, user_id: uuid.UUID) -> AsyncIterator[None]:
-    lock_key = f"user:lock:{user_id}"
-    acquired = await redis.set(lock_key, "1", nx=True, ex=LOCK_TTL_SECONDS)
-    if not acquired:
-        raise WalletLockError(f"Opération déjà en cours pour l'utilisateur {user_id}")
-    try:
-        yield
-    finally:
-        await redis.delete(lock_key)
-
-
-async def get_wallet_for_update(db: AsyncSession, user_id: uuid.UUID) -> Wallet:
-    stmt = select(Wallet).where(Wallet.user_id == user_id).with_for_update()
-    result = await db.execute(stmt)
-    return result.scalar_one()
-
-
-async def create_pending_deposit(
-    db: AsyncSession,
+def declare_payin_pending(
+    db: Session,
     *,
-    user_id: uuid.UUID,
-    internal_reference: str,
-    operator: MobileOperator,
+    user_id: _uuid.UUID,
     amount: Decimal,
-    source_phone: str,
-) -> Transaction:
-    transaction = Transaction(
-        internal_reference=internal_reference,
-        user_id=user_id,
-        type=TransactionType.DEPOSIT,
-        source_operator=operator,
-        destination_operator=None,
-        amount=amount,
-        fee=Decimal("0"),
-        total_collected=amount,
-        jeko_deposit_fee_rate=Decimal("0"),
-        payin_status=TransactionStatus.PENDING,
-        payout_status=None,
-        status=TransactionStatus.PENDING,
-        recipient_name=None,
-        recipient_phone=None,
-        metadata_={"source_phone": source_phone},
+    provider: str,
+    phone_number: str,
+    proof_ref: str | None,
+    declared_via: str,
+) -> dict[str, Any]:
+    """Crée la ligne PENDING côté ledger — pas de crédit avant validation webhook/SMS."""
+    reference = generate_reference("PI")
+    provider_enum = provider.upper()  # 'WAVE' / 'ORANGE_MONEY'
+    db.execute(
+        text("""
+            INSERT INTO ledger_transactions
+              (reference, user_id, type, provider, amount, status, phone_number, proof_ref, metadata)
+            VALUES
+              (:ref, :uid, 'PAY_IN', CAST(:prov AS payment_provider),
+               :amt, 'PENDING', :phone, :proof,
+               CAST(:meta AS JSONB))
+            ON CONFLICT (provider, proof_ref) DO NOTHING
+            RETURNING id, reference
+        """),
+        {
+            "ref": reference,
+            "uid": user_id,
+            "prov": provider_enum,
+            "amt": amount,
+            "phone": phone_number,
+            "proof": proof_ref,
+            "meta": json.dumps({"declared_via": declared_via}),
+        },
     )
-    db.add(transaction)
-    await db.flush()
-    return transaction
+    row = db.execute(
+        text("SELECT id, reference FROM ledger_transactions WHERE reference = :r"),
+        {"r": reference},
+    ).first()
+    db.commit()
+    if not row:
+        # preuve déjà présente → récupère la transaction existante
+        existing = db.execute(
+            text("""
+                SELECT id, reference FROM ledger_transactions
+                WHERE provider = CAST(:prov AS payment_provider)
+                  AND proof_ref = :proof
+            """),
+            {"prov": provider_enum, "proof": proof_ref},
+        ).first()
+        return {
+            "success": False,
+            "message": "Doublon détecté (preuve déjà utilisée)",
+            "reference": existing.reference if existing else None,
+            "transaction_id": existing.id if existing else None,
+        }
+    return {
+        "success": True,
+        "message": "Déclaration enregistrée",
+        "reference": row.reference,
+        "transaction_id": row.id,
+    }
 
 
-async def finalize_kkiapay_deposit(
-    db: AsyncSession,
-    transaction: Transaction,
+def request_payout(
+    db: Session,
     *,
-    success: bool,
-    kkiapay_transaction_id: str,
-) -> Transaction:
-    """
-    Finalise une transaction DEPOSIT après vérification server-side auprès
-    de Kkiapay. Idempotent : si la transaction n'est déjà plus PENDING
-    (déjà confirmée via /deposit/confirm OU via le webhook Kkiapay, peu
-    importe lequel des deux est arrivé en premier), on ne fait rien.
-    """
-    if transaction.payin_status != TransactionStatus.PENDING:
-        return transaction  # déjà traitée, pas de double crédit
+    user_id: _uuid.UUID,
+    amount: Decimal,
+    provider: str,
+    phone_number: str,
+) -> dict[str, Any]:
+    """Appelle la fonction SQL atomique process_payout_deduction."""
+    reference = generate_reference("PO")
+    result = db.execute(
+        text("""
+            SELECT process_payout_deduction(
+                :uid, :amt, :ref,
+                CAST(:prov AS payment_provider), :phone
+            ) AS r
+        """),
+        {
+            "uid": user_id,
+            "amt": amount,
+            "ref": reference,
+            "prov": provider.upper(),
+            "phone": phone_number,
+        },
+    ).scalar_one()
+    db.commit()
+    return dict(result)
 
-    transaction.jeko_payin_id = kkiapay_transaction_id  # champ réutilisé pour stocker la référence Kkiapay
 
-    if success:
-        wallet = await get_wallet_for_update(db, transaction.user_id)
-        await credit_wallet(db, wallet, Decimal(transaction.amount))
-        transaction.payin_status = TransactionStatus.SUCCESS
-        transaction.status = TransactionStatus.SUCCESS
-    else:
-        transaction.payin_status = TransactionStatus.FAILED
-        transaction.status = TransactionStatus.FAILED
-
-    return transaction
-
-
-async def create_pending_transfer(
-    db: AsyncSession,
+def admin_process_payout(
+    db: Session,
     *,
-    user_id: uuid.UUID,
-    internal_reference: str,
-    source_operator: MobileOperator,
-    destination_operator: MobileOperator,
-    net_amount: Decimal,
-    platform_fee: Decimal,
-    total_collected: Decimal,
-    jeko_deposit_fee_rate: Decimal,
-    recipient_name: str,
+    transaction_id: _uuid.UUID,
+    action: str,
+    proof_ref: str | None,
+    admin_id: _uuid.UUID,
+    ip: str | None = None,
+) -> dict[str, Any]:
+    """Route admin unique — APPROVE / REJECT — reembolso atomique côté SQL."""
+    result = db.execute(
+        text("""
+            SELECT admin_process_payout(
+                :tid,
+                :action,
+                :proof,
+                :aid
+            ) AS r
+        """),
+        {
+            "tid": transaction_id,
+            "action": action,
+            "proof": proof_ref,
+            "aid": admin_id,
+        },
+    ).scalar_one()
+    db.commit()
+    payload = dict(result)
+    # Log IP côté audit (déjà dans la fonction SQL via admin_audit_log)
+    if ip:
+        db.execute(
+            text("""
+                UPDATE admin_audit_log
+                   SET ip_address = :ip
+                 WHERE admin_id = :aid
+                   AND target_id = :tid
+                   AND created_at = (
+                       SELECT MAX(created_at) FROM admin_audit_log
+                        WHERE admin_id = :aid AND target_id = :tid
+                   )
+            """),
+            {"ip": ip, "aid": admin_id, "tid": transaction_id},
+        )
+        db.commit()
+    return payload
+
+
+def transfer_internal(
+    db: Session,
+    *,
+    sender_id: _uuid.UUID,
+    amount: Decimal,
     recipient_phone: str,
-    source_phone: str,
-) -> Transaction:
-    transaction = Transaction(
-        internal_reference=internal_reference,
-        user_id=user_id,
-        type=TransactionType.TRANSFER,
-        source_operator=source_operator,
-        destination_operator=destination_operator,
-        amount=net_amount,
-        fee=platform_fee,
-        total_collected=total_collected,
-        jeko_deposit_fee_rate=jeko_deposit_fee_rate,
-        payin_status=TransactionStatus.PENDING,
-        payout_status=None,
-        status=TransactionStatus.PENDING,
-        recipient_name=recipient_name,
-        recipient_phone=recipient_phone,
-        metadata_={"source_phone": source_phone},
-    )
-    db.add(transaction)
-    await db.flush()
-    return transaction
+) -> dict[str, Any]:
+    """Appelle la fonction SQL atomique process_internal_transfer (débit + crédit)."""
+    sender_reference = generate_reference("IT")
+    recipient_reference = generate_reference("IT")
+    result = db.execute(
+        text("""
+            SELECT process_internal_transfer(
+                :sender_id, :amount, :recipient_phone,
+                :sender_ref, :recipient_ref
+            ) AS r
+        """),
+        {
+            "sender_id": sender_id,
+            "amount": amount,
+            "recipient_phone": recipient_phone,
+            "sender_ref": sender_reference,
+            "recipient_ref": recipient_reference,
+        },
+    ).scalar_one()
+    db.commit()
+    return dict(result)
 
 
-async def create_pending_withdrawal(
-    db: AsyncSession,
+def finalize_payin(
+    db: Session,
     *,
-    user_id: uuid.UUID,
-    internal_reference: str,
-    operator: MobileOperator,
-    amount: Decimal,
-) -> Transaction:
-    transaction = Transaction(
-        internal_reference=internal_reference,
-        user_id=user_id,
-        type=TransactionType.WITHDRAWAL,
-        source_operator=None,
-        destination_operator=operator,
-        amount=amount,
-        fee=Decimal("0"),
-        total_collected=None,
-        jeko_deposit_fee_rate=None,
-        payin_status=TransactionStatus.SUCCESS,
-        payout_status=TransactionStatus.PENDING,
-        status=TransactionStatus.PENDING,
-        recipient_name=None,
-        recipient_phone=None,
-    )
-    db.add(transaction)
-    await db.flush()
-    return transaction
+    reference: str,
+    proof_ref: str,
+    confirmed_amount: Decimal | None = None,
+) -> dict[str, Any]:
+    """Appelle process_payin_credit — atomique, idempotent.
 
-
-async def debit_wallet(db: AsyncSession, wallet: Wallet, amount: Decimal) -> None:
-    if Decimal(wallet.balance) < amount:
-        raise InsufficientBalanceError(f"Solde insuffisant : {wallet.balance} XOF disponible, {amount} XOF demandé.")
-    wallet.balance = Decimal(wallet.balance) - amount
-
-
-async def credit_wallet(db: AsyncSession, wallet: Wallet, amount: Decimal) -> None:
-    wallet.balance = Decimal(wallet.balance) + amount
+    confirmed_amount = montant vu dans le webhook/SMS opérateur.
+    Si fourni, la fonction SQL refuse de créditer si ça ne correspond
+    pas exactement au montant déclaré par l'utilisateur (anti-fraude).
+    """
+    row = db.execute(
+        text("SELECT process_payin_credit(:ref, :proof, :amt) AS r"),
+        {"ref": reference, "proof": proof_ref, "amt": confirmed_amount},
+    ).scalar_one()
+    db.commit()
+    return dict(row)
