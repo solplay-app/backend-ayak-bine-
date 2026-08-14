@@ -9,6 +9,17 @@ from app.config import get_settings
 settings = get_settings()
 
 
+def _async_url(url: str) -> str:
+    """Force le driver asyncpg si l'URL ne precise aucun driver (ex:
+    'postgresql://...' tel que fourni par defaut par Render), sinon
+    create_async_engine echoue au demarrage (driver sync par defaut)."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+
 def _sync_url(url: str) -> str:
     """Convertit l'URL async (asyncpg) en URL sync (psycopg2) si besoin,
     pour que les migrations et get_sync_db utilisent un vrai driver
@@ -25,7 +36,7 @@ def _sync_url(url: str) -> str:
 
 
 engine = create_async_engine(
-    settings.DATABASE_URL,
+    _async_url(settings.DATABASE_URL),
     pool_pre_ping=True,
     pool_size=10,
     max_overflow=20,
