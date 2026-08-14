@@ -144,8 +144,10 @@ $$;
 
 CREATE INDEX IF NOT EXISTS idx_ledger_user         ON ledger_transactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_ledger_user_created  ON ledger_transactions(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_ledger_pending_payout ON ledger_transactions(status, type, created_at)
-    WHERE status = 'PENDING' AND type = 'PAY_OUT';
+-- L'index partiel sur les nouvelles valeurs d'enum (PENDING/PAY_OUT) est
+-- créé séparément dans migration_005 : PostgreSQL interdit d'utiliser une
+-- valeur d'ENUM tout juste ajoutée (ALTER TYPE ADD VALUE) dans la même
+-- transaction — elle doit d'abord être "committée".
 
 -- ---------------------------------------------------------------------
 -- Audit log des actions Admin
