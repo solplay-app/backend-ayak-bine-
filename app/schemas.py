@@ -151,4 +151,53 @@ class InternalTransferResult(BaseModel):
     message: str
     sender_reference: str | None = None
     recipient_reference: str | None = None
+    net_amount: Decimal | None = None
+    fee: Decimal | None = None
+    total_charged: Decimal | None = None
     new_balance: Decimal | None = None
+
+
+class FeePercentResponse(BaseModel):
+    fee_percent: Decimal
+
+
+class FeePercentUpdateRequest(BaseModel):
+    fee_percent: Decimal = Field(..., ge=0, le=100)
+
+
+class DashboardStatsResponse(BaseModel):
+    solde_global: Decimal
+    recu_aujourdhui: Decimal
+    retire_aujourdhui: Decimal
+    frais_collectes_aujourdhui: Decimal
+    frais_collectes_total: Decimal
+    fee_percent: Decimal
+    nb_utilisateurs: int
+    nb_payouts_en_attente: int
+
+
+class AdminUserOut(BaseModel):
+    id: str
+    phone_number: str
+    full_name: str
+    role: str
+    is_active: bool
+    kyc_status: str | None = None
+    wallet_balance: Decimal
+    created_at: datetime
+
+
+class UserStatusUpdateRequest(BaseModel):
+    is_active: bool
+
+
+class KycDecisionRequest(BaseModel):
+    decision: str = Field(..., pattern="^(approve|reject)$")
+    reason: str | None = None
+
+
+class DailyStatPoint(BaseModel):
+    date: str
+    recu: Decimal
+    retire: Decimal
+    frais: Decimal
