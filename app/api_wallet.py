@@ -13,10 +13,10 @@ from app.auth import get_current_user
 from app.database import get_db, get_sync_db
 from app.models import LedgerTransaction, PaymentProvider, TransactionStatus, TransactionType, User, Wallet
 from app.schemas import (
-    InternalTransferRequest, InternalTransferResult,
+    FeePercentResponse, InternalTransferRequest, InternalTransferResult,
     PayInDeclareRequest, PayInResult, PayOutRequest, TransactionOut, WalletOut,
 )
-from app.wallet_service import declare_payin_pending, generate_reference, request_payout, transfer_internal
+from app.wallet_service import declare_payin_pending, generate_reference, get_fee_percent, request_payout, transfer_internal
 
 router = APIRouter(prefix="/api/v1/wallet", tags=["Wallet"])
 
@@ -119,6 +119,15 @@ async def payout_request(
     return result
 
 
+@router.get("/fee-percent", response_model=FeePercentResponse)
+async def get_current_fee_percent(
+    user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    """Pourcentage de frais plateforme actuel — utilisé par l'app pour l'affichage en temps réel."""
+    return FeePercentResponse(fee_percent=get_fee_percent(db))
+
+
 @router.post("/transfer/internal", response_model=InternalTransferResult)
 async def transfer_internal_endpoint(
     payload: InternalTransferRequest,
@@ -139,6 +148,9 @@ async def transfer_internal_endpoint(
         message=result["message"],
         sender_reference=result.get("sender_reference"),
         recipient_reference=result.get("recipient_reference"),
+        net_amount=result.get("net_amount"),
+        fee=result.get("fee"),
+        total_charged=result.get("total_charged"),
         new_balance=result.get("new_balance"),
     )
 
