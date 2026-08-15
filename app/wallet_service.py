@@ -154,6 +154,26 @@ def admin_process_payout(
     return payload
 
 
+def get_fee_percent(db: Session) -> Decimal:
+    """Lit le pourcentage de frais plateforme actuel (réglable par l'admin)."""
+    row = db.execute(
+        text("SELECT value FROM platform_settings WHERE key = 'fee_percent'")
+    ).first()
+    return Decimal(row[0]) if row else Decimal("8")
+
+
+def set_fee_percent(db: Session, percent: Decimal) -> None:
+    db.execute(
+        text("""
+            INSERT INTO platform_settings (key, value, updated_at)
+            VALUES ('fee_percent', :v, CURRENT_TIMESTAMP)
+            ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = CURRENT_TIMESTAMP
+        """),
+        {"v": str(percent)},
+    )
+    db.commit()
+
+
 def transfer_internal(
     db: Session,
     *,
@@ -161,14 +181,19 @@ def transfer_internal(
     amount: Decimal,
     recipient_phone: str,
 ) -> dict[str, Any]:
-    """Appelle la fonction SQL atomique process_internal_transfer (débit + crédit)."""
+    """Appelle la fonction SQL atomique process_internal_transfer (débit + crédit).
+
+    Le frais plateforme (%) est ajouté au montant : l'expéditeur paie
+    amount + frais, le destinataire reçoit `amount` plein.
+    """
     sender_reference = generate_reference("IT")
     recipient_reference = generate_reference("IT")
+    fee_percent = get_fee_percent(db)
     result = db.execute(
         text("""
             SELECT process_internal_transfer(
                 :sender_id, :amount, :recipient_phone,
-                :sender_ref, :recipient_ref
+                :sender_ref, :recipient_ref, :fee_percent
             ) AS r
         """),
         {
@@ -177,6 +202,7 @@ def transfer_internal(
             "recipient_phone": recipient_phone,
             "sender_ref": sender_reference,
             "recipient_ref": recipient_reference,
+            "fee_percent": fee_percent,
         },
     ).scalar_one()
     db.commit()
