@@ -10,14 +10,28 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from datetime import datetime as _dt, time as _time
+from decimal import Decimal
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
+from app.auth import get_current_user
 from app.config import get_settings
-from app.database import get_db
-from app.models import KycStatus, KycSubmission, LedgerTransaction, TransactionStatus, User, Wallet
+from app.database import get_db, get_sync_db
+from app.models import (
+    KycStatus, KycSubmission, LedgerTransaction, TransactionStatus,
+    TransactionType, User, UserRole, Wallet,
+)
+from app.schemas import (
+    AdminActionRequest, AdminUserOut, DailyStatPoint, DashboardStatsResponse,
+    FeePercentResponse, FeePercentUpdateRequest, KycDecisionRequest, UserStatusUpdateRequest,
+)
+from app.wallet_service import admin_process_payout, get_fee_percent, set_fee_percent
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
 settings = get_settings()
@@ -30,6 +44,408 @@ def _check_secret(secret: str) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Route admin non configurée.")
     if secret != settings.ADMIN_BOOTSTRAP_SECRET:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Secret invalide.")
+
+
+async def require_admin(user: User = Depends(get_current_user)) -> User:
+    """Dépendance JWT — réutilise la connexion normale (/auth/login), exige role=ADMIN."""
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Réservé aux administrateurs.")
+    return user
+
+
+# ------------------------- Tableau de bord (JWT) --------------------------
+
+@router.get("/dashboard-stats", response_model=DashboardStatsResponse)
+async def dashboard_stats(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Vue d'ensemble pour le dashboard : soldes, flux du jour, frais collectés."""
+    today_start = _dt.combine(_dt.now(tz=None).date(), _time.min)
+
+    solde_global = (await db.execute(select(func.coalesce(func.sum(Wallet.balance), 0)))).scalar_one()
+
+    recu_jour = (await db.execute(
+        select(func.coalesce(func.sum(LedgerTransaction.amount), 0)).where(
+            LedgerTransaction.type == TransactionType.PAY_IN,
+            LedgerTransaction.status == TransactionStatus.SUCCESS,
+            LedgerTransaction.created_at >= today_start,
+        )
+    )).scalar_one()
+
+    retire_jour = (await db.execute(
+        select(func.coalesce(func.sum(LedgerTransaction.amount), 0)).where(
+            LedgerTransaction.type == TransactionType.PAY_OUT,
+            LedgerTransaction.status == TransactionStatus.SUCCESS,
+            LedgerTransaction.created_at >= today_start,
+        )
+    )).scalar_one()
+
+    frais_jour = (await db.execute(
+        select(func.coalesce(func.sum(LedgerTransaction.fee), 0)).where(
+            LedgerTransaction.created_at >= today_start,
+        )
+    )).scalar_one()
+
+    frais_total = (await db.execute(
+        select(func.coalesce(func.sum(LedgerTransaction.fee), 0))
+    )).scalar_one()
+
+    nb_users = (await db.execute(select(func.count(User.id)))).scalar_one()
+
+    nb_pending_payouts = (await db.execute(
+        select(func.count(LedgerTransaction.id)).where(
+            LedgerTransaction.type == TransactionType.PAY_OUT,
+            LedgerTransaction.status == TransactionStatus.PENDING,
+        )
+    )).scalar_one()
+
+    # Lecture directe du réglage (table simple key/value, pas de modèle ORM dédié).
+    from sqlalchemy import text as _text
+    fp_row = (await db.execute(_text("SELECT value FROM platform_settings WHERE key = 'fee_percent'"))).first()
+    fee_percent = Decimal(fp_row[0]) if fp_row else Decimal("8")
+
+    return DashboardStatsResponse(
+        solde_global=Decimal(solde_global),
+        recu_aujourdhui=Decimal(recu_jour),
+        retire_aujourdhui=Decimal(retire_jour),
+        frais_collectes_aujourdhui=Decimal(frais_jour),
+        frais_collectes_total=Decimal(frais_total),
+        fee_percent=fee_percent,
+        nb_utilisateurs=nb_users,
+        nb_payouts_en_attente=nb_pending_payouts,
+    )
+
+
+@router.get("/settings/fee-percent", response_model=FeePercentResponse)
+async def get_fee_percent_route(
+    admin: User = Depends(require_admin),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    return FeePercentResponse(fee_percent=get_fee_percent(db))
+
+
+@router.put("/settings/fee-percent", response_model=FeePercentResponse)
+async def update_fee_percent_route(
+    payload: FeePercentUpdateRequest,
+    admin: User = Depends(require_admin),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    set_fee_percent(db, payload.fee_percent)
+    return FeePercentResponse(fee_percent=payload.fee_percent)
+
+
+# ------------------------- Pay-Out en attente (JWT) ------------------------
+
+@router.get("/pending-payouts")
+async def pending_payouts(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(LedgerTransaction, User.phone_number.label("user_phone"))
+        .join(User, User.id == LedgerTransaction.user_id)
+        .where(
+            LedgerTransaction.type == TransactionType.PAY_OUT,
+            LedgerTransaction.status == TransactionStatus.PENDING,
+        )
+        .order_by(LedgerTransaction.created_at.asc())
+    )
+    rows = result.all()
+    return [
+        {
+            "id": str(t.id),
+            "reference": t.reference,
+            "provider": t.provider.value,
+            "amount": str(t.amount),
+            "phone_number": t.phone_number,
+            "user_phone": user_phone,
+            "created_at": t.created_at.isoformat(),
+        }
+        for t, user_phone in rows
+    ]
+
+
+@router.post("/process-payout/{transaction_id}")
+async def process_payout_route(
+    transaction_id: str,
+    payload: AdminActionRequest,
+    admin: User = Depends(require_admin),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    if payload.action.upper() not in ("APPROVE", "REJECT"):
+        raise HTTPException(status_code=400, detail="Action invalide (APPROVE ou REJECT)")
+    result = admin_process_payout(
+        db,
+        transaction_id=transaction_id,
+        action=payload.action.upper(),
+        proof_ref=payload.proof_ref,
+        admin_id=admin.id,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message", "Échec"))
+    return result
+
+
+# ------------------------- Historique transactions (JWT) -------------------
+
+@router.get("/transactions")
+async def list_transactions(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    type: str | None = Query(default=None, description="PAY_IN, PAY_OUT ou INTERNAL_TRANSFER"),
+    status_filter: str | None = Query(default=None, alias="status"),
+    phone: str | None = Query(default=None, description="Recherche par numéro (client ou destinataire)"),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """Liste paginée et filtrable de toutes les transactions — vue admin complète."""
+    q = select(LedgerTransaction, User.phone_number.label("user_phone")).join(
+        User, User.id == LedgerTransaction.user_id
+    )
+    if type:
+        try:
+            q = q.where(LedgerTransaction.type == TransactionType(type.upper()))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Type de transaction invalide.")
+    if status_filter:
+        try:
+            q = q.where(LedgerTransaction.status == TransactionStatus(status_filter.upper()))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Statut invalide.")
+    if phone:
+        like = f"%{phone.strip()}%"
+        q = q.where((User.phone_number.ilike(like)) | (LedgerTransaction.phone_number.ilike(like)))
+
+    total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar_one()
+
+    q = q.order_by(LedgerTransaction.created_at.desc()).limit(limit).offset(offset)
+    rows = (await db.execute(q)).all()
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            {
+                "id": str(t.id),
+                "reference": t.reference,
+                "type": t.type.value,
+                "provider": t.provider.value,
+                "amount": str(t.amount),
+                "fee": str(t.fee),
+                "status": t.status.value,
+                "phone_number": t.phone_number,
+                "user_phone": user_phone,
+                "proof_ref": t.proof_ref,
+                "created_at": t.created_at.isoformat(),
+            }
+            for t, user_phone in rows
+        ],
+    }
+
+
+# ------------------------- Statistiques journalières (JWT) -----------------
+
+@router.get("/stats/daily", response_model=list[DailyStatPoint])
+async def daily_stats(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    days: int = Query(default=14, le=90, ge=1),
+):
+    """Série temporelle (reçu / retiré / frais par jour) pour les graphiques du dashboard."""
+    from sqlalchemy import text as _text
+
+    rows = (
+        await db.execute(
+            _text("""
+                SELECT
+                    d::date AS day,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'PAY_IN' AND status = 'SUCCESS'), 0) AS recu,
+                    COALESCE(SUM(amount) FILTER (WHERE type = 'PAY_OUT' AND status = 'SUCCESS'), 0) AS retire,
+                    COALESCE(SUM(fee), 0) AS frais
+                FROM generate_series(
+                    CURRENT_DATE - (:days - 1) * INTERVAL '1 day', CURRENT_DATE, INTERVAL '1 day'
+                ) AS d
+                LEFT JOIN ledger_transactions
+                    ON ledger_transactions.created_at::date = d::date
+                GROUP BY d
+                ORDER BY d ASC
+            """),
+            {"days": days},
+        )
+    ).all()
+
+    return [
+        DailyStatPoint(date=str(r.day), recu=Decimal(r.recu), retire=Decimal(r.retire), frais=Decimal(r.frais))
+        for r in rows
+    ]
+
+
+# ------------------------- Gestion des utilisateurs (JWT) ------------------
+
+@router.get("/users", response_model=list[AdminUserOut])
+async def list_users(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+    search: str | None = Query(default=None, description="Recherche par téléphone ou nom"),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    q = select(User, Wallet.balance).join(Wallet, Wallet.user_id == User.id, isouter=True)
+    if search:
+        like = f"%{search.strip()}%"
+        q = q.where((User.phone_number.ilike(like)) | (User.full_name.ilike(like)))
+    q = q.order_by(User.created_at.desc()).limit(limit).offset(offset)
+    rows = (await db.execute(q)).all()
+
+    # Statut KYC le plus récent par utilisateur (une seule requête groupée).
+    user_ids = [u.id for u, _ in rows]
+    kyc_map: dict = {}
+    if user_ids:
+        kyc_rows = (
+            await db.execute(
+                select(KycSubmission.user_id, KycSubmission.status)
+                .where(KycSubmission.user_id.in_(user_ids))
+                .order_by(KycSubmission.created_at.desc())
+            )
+        ).all()
+        for uid, kstatus in kyc_rows:
+            kyc_map.setdefault(uid, kstatus.value)
+
+    return [
+        AdminUserOut(
+            id=str(u.id),
+            phone_number=u.phone_number,
+            full_name=u.full_name,
+            role=u.role.value,
+            is_active=u.is_active,
+            kyc_status=kyc_map.get(u.id),
+            wallet_balance=Decimal(balance or 0),
+            created_at=u.created_at,
+        )
+        for u, balance in rows
+    ]
+
+
+@router.get("/users/{user_id}")
+async def user_detail(
+    user_id: str,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable.")
+    wallet = (await db.execute(select(Wallet).where(Wallet.user_id == user.id))).scalar_one_or_none()
+    history = (
+        await db.execute(
+            select(LedgerTransaction)
+            .where(LedgerTransaction.user_id == user.id)
+            .order_by(LedgerTransaction.created_at.desc())
+            .limit(100)
+        )
+    ).scalars().all()
+
+    return {
+        "id": str(user.id),
+        "phone_number": user.phone_number,
+        "full_name": user.full_name,
+        "role": user.role.value,
+        "is_active": user.is_active,
+        "created_at": user.created_at.isoformat(),
+        "wallet_balance": str(wallet.balance) if wallet else "0",
+        "history": [
+            {
+                "reference": t.reference,
+                "type": t.type.value,
+                "provider": t.provider.value,
+                "amount": str(t.amount),
+                "fee": str(t.fee),
+                "status": t.status.value,
+                "created_at": t.created_at.isoformat(),
+            }
+            for t in history
+        ],
+    }
+
+
+@router.put("/users/{user_id}/status")
+async def update_user_status(
+    user_id: str,
+    payload: UserStatusUpdateRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Bloque / débloque un compte client (ex: comportement suspect)."""
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable.")
+    if user.role == UserRole.ADMIN:
+        raise HTTPException(status_code=400, detail="Impossible de bloquer un compte administrateur.")
+    user.is_active = payload.is_active
+    user.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"success": True, "id": str(user.id), "is_active": user.is_active}
+
+
+# ---------- Vérification d'identité (KYC) — via JWT, pour le dashboard -----
+
+@router.get("/kyc/pending-list")
+async def kyc_pending_list(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Version JSON (consommée par le dashboard) de /kyc/pending."""
+    result = await db.execute(
+        select(KycSubmission, User)
+        .join(User, User.id == KycSubmission.user_id)
+        .where(KycSubmission.status == KycStatus.PENDING)
+        .order_by(KycSubmission.created_at.asc())
+    )
+    rows = result.all()
+    return [
+        {
+            "submission_id": str(submission.id),
+            "user_phone": user.phone_number,
+            "user_full_name": user.full_name,
+            "id_document_base64": submission.id_document_base64,
+            "selfie_base64": submission.selfie_base64,
+            "created_at": submission.created_at.isoformat(),
+        }
+        for submission, user in rows
+    ]
+
+
+@router.post("/kyc/{submission_id}/decide")
+async def kyc_decide_jwt(
+    submission_id: str,
+    payload: KycDecisionRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    submission = (
+        await db.execute(select(KycSubmission).where(KycSubmission.id == submission_id))
+    ).scalar_one_or_none()
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Demande introuvable.")
+    if submission.status != KycStatus.PENDING:
+        raise HTTPException(status_code=409, detail=f"Déjà traitée (statut actuel : {submission.status.value}).")
+
+    user = (await db.execute(select(User).where(User.id == submission.user_id))).scalar_one()
+
+    if payload.decision == "approve":
+        submission.status = KycStatus.APPROVED
+        submission.review_note = None
+        message = f"Compte de {user.full_name} vérifié avec succès."
+    else:
+        submission.status = KycStatus.REJECTED
+        submission.review_note = payload.reason or "Document non conforme"
+        message = f"Demande de {user.full_name} rejetée."
+
+    submission.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return {"success": True, "message": message}
 
 
 # ---------------------------- Transactions -------------------------------
