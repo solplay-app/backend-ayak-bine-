@@ -37,6 +37,7 @@ class PaymentProvider(str, enum.Enum):
     WAVE = "WAVE"
     ORANGE_MONEY = "ORANGE_MONEY"
     INTERNAL = "INTERNAL"
+    ADMIN_MANUAL = "ADMIN_MANUAL"
 
 
 class KycStatus(str, enum.Enum):
