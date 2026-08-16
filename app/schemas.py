@@ -201,3 +201,22 @@ class DailyStatPoint(BaseModel):
     recu: Decimal
     retire: Decimal
     frais: Decimal
+
+
+class AdminCreditRequest(BaseModel):
+    amount: Decimal = Field(..., gt=0)
+    reason: str = Field(..., min_length=3, max_length=200)
+
+
+class PaymentLinksResponse(BaseModel):
+    wave: str | None = None
+    orange: str | None = None
+    mtn: str | None = None
+    moov: str | None = None
+
+
+class PaymentLinksUpdateRequest(BaseModel):
+    wave: str | None = None
+    orange: str | None = None
+    mtn: str | None = None
+    moov: str | None = None
