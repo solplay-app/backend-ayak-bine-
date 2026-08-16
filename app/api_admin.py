@@ -16,7 +16,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
-from sqlalchemy import func, select, text
+from sqlalchemy import cast, func, select, text
+from sqlalchemy import String as SAString
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -326,15 +327,18 @@ async def list_users(
     user_ids = [u.id for u, _ in rows]
     kyc_map: dict = {}
     if user_ids:
+        # cast en texte : évite un crash SQLAlchemy si une ligne contient une
+        # valeur de statut qui n'existe plus dans l'enum Python KycStatus
+        # (ex. anciennes valeurs "VERIFIED" jamais nettoyées en base).
         kyc_rows = (
             await db.execute(
-                select(KycSubmission.user_id, KycSubmission.status)
+                select(KycSubmission.user_id, cast(KycSubmission.status, SAString))
                 .where(KycSubmission.user_id.in_(user_ids))
                 .order_by(KycSubmission.created_at.desc())
             )
         ).all()
         for uid, kstatus in kyc_rows:
-            kyc_map.setdefault(uid, kstatus.value)
+            kyc_map.setdefault(uid, kstatus)
 
     return [
         AdminUserOut(
@@ -704,13 +708,13 @@ async def users_html_page(
     if user_ids:
         kyc_rows = (
             await db.execute(
-                select(KycSubmission.user_id, KycSubmission.status)
+                select(KycSubmission.user_id, cast(KycSubmission.status, SAString))
                 .where(KycSubmission.user_id.in_(user_ids))
                 .order_by(KycSubmission.created_at.desc())
             )
         ).all()
         for uid, kstatus in kyc_rows:
-            kyc_map.setdefault(uid, kstatus.value)
+            kyc_map.setdefault(uid, kstatus)
 
     kyc_badge = {
         "APPROVED": "background:#16a34a;color:white;",
