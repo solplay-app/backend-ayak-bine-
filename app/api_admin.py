@@ -16,7 +16,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
@@ -28,10 +28,14 @@ from app.models import (
     TransactionType, User, UserRole, Wallet,
 )
 from app.schemas import (
-    AdminActionRequest, AdminUserOut, DailyStatPoint, DashboardStatsResponse,
-    FeePercentResponse, FeePercentUpdateRequest, KycDecisionRequest, UserStatusUpdateRequest,
+    AdminActionRequest, AdminCreditRequest, AdminUserOut, DailyStatPoint, DashboardStatsResponse,
+    FeePercentResponse, FeePercentUpdateRequest, KycDecisionRequest, PaymentLinksResponse,
+    PaymentLinksUpdateRequest, UserStatusUpdateRequest,
 )
-from app.wallet_service import admin_process_payout, get_fee_percent, set_fee_percent
+from app.wallet_service import (
+    admin_manual_credit, admin_process_payout, finalize_payin,
+    get_fee_percent, get_payment_links, set_fee_percent, set_payment_links,
+)
 
 router = APIRouter(prefix="/api/v1/admin", tags=["Admin"])
 settings = get_settings()
@@ -133,6 +137,24 @@ async def update_fee_percent_route(
 ):
     set_fee_percent(db, payload.fee_percent)
     return FeePercentResponse(fee_percent=payload.fee_percent)
+
+
+@router.get("/settings/payment-links", response_model=PaymentLinksResponse)
+async def get_payment_links_route(
+    admin: User = Depends(require_admin),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    return PaymentLinksResponse(**get_payment_links(db))
+
+
+@router.put("/settings/payment-links", response_model=PaymentLinksResponse)
+async def update_payment_links_route(
+    payload: PaymentLinksUpdateRequest,
+    admin: User = Depends(require_admin),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    set_payment_links(db, payload.model_dump())
+    return PaymentLinksResponse(**get_payment_links(db))
 
 
 # ------------------------- Pay-Out en attente (JWT) ------------------------
@@ -389,6 +411,26 @@ async def update_user_status(
     return {"success": True, "id": str(user.id), "is_active": user.is_active}
 
 
+@router.post("/users/{user_id}/credit")
+async def credit_user_wallet(
+    user_id: str,
+    payload: AdminCreditRequest,
+    admin: User = Depends(require_admin),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    """Recharge manuelle du solde d'un client par l'admin — dépannage,
+    remboursement commercial, ou avance en attendant une vraie intégration
+    opérateur (Wave/Orange). Aucun paiement réel n'est vérifié ici : à
+    utiliser uniquement quand l'argent a déjà été reçu par un autre moyen.
+    """
+    result = admin_manual_credit(
+        db, user_id=user_id, amount=payload.amount, reason=payload.reason, admin_id=admin.id,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message", "Échec de la recharge."))
+    return result
+
+
 # ---------- Vérification d'identité (KYC) — via JWT, pour le dashboard -----
 
 @router.get("/kyc/pending-list")
@@ -446,6 +488,86 @@ async def kyc_decide_jwt(
     submission.updated_at = datetime.now(timezone.utc)
     await db.commit()
     return {"success": True, "message": message}
+
+
+# ------------------------- Dépôts (Pay-In) en attente (JWT) ----------------
+# Filet de sécurité : le crédit est normalement automatique (webhook/SMS
+# opérateur). Si ça échoue ou n'est pas encore branché, le dépôt reste
+# PENDING indéfiniment sans ceci — l'admin doit pouvoir intervenir.
+
+@router.get("/pending-payins")
+async def pending_payins(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(LedgerTransaction, User.phone_number.label("user_phone"))
+        .join(User, User.id == LedgerTransaction.user_id)
+        .where(
+            LedgerTransaction.type == TransactionType.PAY_IN,
+            LedgerTransaction.status == TransactionStatus.PENDING,
+        )
+        .order_by(LedgerTransaction.created_at.asc())
+    )
+    rows = result.all()
+    return [
+        {
+            "id": str(t.id),
+            "reference": t.reference,
+            "provider": t.provider.value,
+            "amount": str(t.amount),
+            "phone_number": t.phone_number,
+            "user_phone": user_phone,
+            "created_at": t.created_at.isoformat(),
+        }
+        for t, user_phone in rows
+    ]
+
+
+@router.post("/process-payin/{transaction_id}")
+async def process_payin_route(
+    transaction_id: str,
+    payload: AdminActionRequest,
+    admin: User = Depends(require_admin),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    """Valide ou rejette manuellement un dépôt resté bloqué en PENDING
+    (webhook/SMS jamais reçu, ou intégration opérateur pas encore active).
+    """
+    if payload.action.upper() not in ("APPROVE", "REJECT"):
+        raise HTTPException(status_code=400, detail="Action invalide (APPROVE ou REJECT)")
+
+    if payload.action.upper() == "REJECT":
+        row = db.execute(
+            text("""
+                UPDATE ledger_transactions
+                SET status = 'FAILED', updated_at = CURRENT_TIMESTAMP
+                WHERE id = :tid AND status = 'PENDING' AND type = 'PAY_IN'
+                RETURNING reference
+            """),
+            {"tid": transaction_id},
+        ).first()
+        db.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Dépôt introuvable ou déjà traité.")
+        return {"success": True, "message": f"Dépôt {row[0]} rejeté."}
+
+    tx_row = db.execute(
+        text("SELECT reference, amount FROM ledger_transactions WHERE id = :tid AND type = 'PAY_IN'"),
+        {"tid": transaction_id},
+    ).first()
+    if not tx_row:
+        raise HTTPException(status_code=404, detail="Dépôt introuvable.")
+
+    result = finalize_payin(
+        db,
+        reference=tx_row.reference,
+        proof_ref=payload.proof_ref or f"MANUEL-ADMIN-{admin.phone_number}",
+        confirmed_amount=tx_row.amount,  # confirmation manuelle : on fait confiance au montant déclaré
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message", "Échec de la validation."))
+    return result
 
 
 # ---------------------------- Transactions -------------------------------
