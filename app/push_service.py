@@ -44,6 +44,11 @@ def _get_credentials() -> Credentials | None:
 
     settings = get_settings()
     if not settings.FIREBASE_PROJECT_ID or not settings.FIREBASE_SERVICE_ACCOUNT_JSON:
+        logger.warning(
+            "FIREBASE_PROJECT_ID et/ou FIREBASE_SERVICE_ACCOUNT_JSON non configurés "
+            "sur ce déploiement — toutes les notifications push sont ignorées "
+            "silencieusement (aucune erreur ne sera levée)."
+        )
         return None
     try:
         info = json.loads(settings.FIREBASE_SERVICE_ACCOUNT_JSON)
