@@ -194,11 +194,19 @@ async def pending_payouts(
 async def process_payout_route(
     transaction_id: str,
     payload: AdminActionRequest,
+    background_tasks: BackgroundTasks,
     admin: User = Depends(require_admin),
     db: Annotated[Session, Depends(get_sync_db)] = None,
 ):
     if payload.action.upper() not in ("APPROVE", "REJECT"):
         raise HTTPException(status_code=400, detail="Action invalide (APPROVE ou REJECT)")
+    # Récupéré AVANT l'appel SQL : la fonction admin_process_payout() ne
+    # renvoie que {success, message}, pas le montant/destinataire — il faut
+    # ces infos pour notifier le bon utilisateur.
+    tx_info = db.execute(
+        text("SELECT user_id, amount, provider FROM ledger_transactions WHERE id = :tid"),
+        {"tid": transaction_id},
+    ).first()
     result = admin_process_payout(
         db,
         transaction_id=transaction_id,
@@ -208,6 +216,21 @@ async def process_payout_route(
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("message", "Échec"))
+
+    if tx_info is not None:
+        action = payload.action.upper()
+        if action == "APPROVE":
+            title = "Retrait envoyé"
+            body = f"{tx_info.amount} XOF ont été envoyés vers votre compte {tx_info.provider}."
+        else:
+            title = "Retrait annulé"
+            body = f"Votre retrait de {tx_info.amount} XOF a été annulé et remboursé sur votre solde Ayak'bine."
+        background_tasks.add_task(
+            notify_user_background, tx_info.user_id,
+            title=title,
+            body=body,
+            data={"type": "payout_" + action.lower(), "reference": transaction_id},
+        )
     return result
 
 
