@@ -24,4 +24,8 @@ python-multipart==0.0.9
 tenacity==9.0.0
 
 # Notifications push (FCM HTTP v1) — auth OAuth2 du compte de service Google.
+# google-auth utilise requests comme transport HTTP par défaut ; sans ce
+# package explicite, l'import échoue au démarrage ("The requests library is
+# not installed") et le service ne boote plus du tout.
 google-auth==2.35.0
+requests==2.32.3
