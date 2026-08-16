@@ -14,7 +14,7 @@ from datetime import datetime as _dt, time as _time
 from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from fastapi.responses import HTMLResponse
 from sqlalchemy import cast, func, select, text
 from sqlalchemy import String as SAString
@@ -33,7 +33,7 @@ from app.schemas import (
     FeePercentResponse, FeePercentUpdateRequest, KycDecisionRequest, PaymentLinksResponse,
     PaymentLinksUpdateRequest, UserStatusUpdateRequest,
 )
-from app.push_service import notify_user
+from app.push_service import notify_user_background
 from app.wallet_service import (
     admin_manual_credit, admin_process_payout, finalize_payin,
     get_fee_percent, get_payment_links, set_fee_percent, set_payment_links,
@@ -420,6 +420,7 @@ async def update_user_status(
 async def credit_user_wallet(
     user_id: str,
     payload: AdminCreditRequest,
+    background_tasks: BackgroundTasks,
     admin: User = Depends(require_admin),
     db: Annotated[Session, Depends(get_sync_db)] = None,
 ):
@@ -433,8 +434,10 @@ async def credit_user_wallet(
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("message", "Échec de la recharge."))
-    notify_user(
-        db, user_id,
+    # En tâche de fond : l'appel réseau Google/FCM est synchrone et peut être
+    # lent, il ne doit jamais retarder ni faire échouer la réponse à l'admin.
+    background_tasks.add_task(
+        notify_user_background, user_id,
         title="Solde rechargé",
         body=f"{payload.amount} XOF ont été ajoutés à votre solde Ayak'bine.",
         data={"type": "wallet_credited", "reference": result.get("reference", "")},
@@ -539,6 +542,7 @@ async def pending_payins(
 async def process_payin_route(
     transaction_id: str,
     payload: AdminActionRequest,
+    background_tasks: BackgroundTasks,
     admin: User = Depends(require_admin),
     db: Annotated[Session, Depends(get_sync_db)] = None,
 ):
@@ -578,8 +582,9 @@ async def process_payin_route(
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("message", "Échec de la validation."))
-    notify_user(
-        db, tx_row.user_id,
+    # En tâche de fond, pour la même raison que credit_user_wallet ci-dessus.
+    background_tasks.add_task(
+        notify_user_background, tx_row.user_id,
         title="Wallet rechargé",
         body=f"{tx_row.amount} XOF ont été ajoutés à votre solde Ayak'bine.",
         data={"type": "wallet_credited", "reference": tx_row.reference},

@@ -99,31 +99,70 @@ def notify_user(
     Envoie la notification à TOUS les appareils enregistrés de cet
     utilisateur. Supprime automatiquement les tokens invalides.
     Best-effort — n'interrompt jamais l'appelant en cas d'échec.
+
+    IMPORTANT : cette fonction fait des appels réseau SYNCHRONES et
+    BLOQUANTS (auth Google + FCM). Ne jamais l'appeler directement dans le
+    corps d'une route — utiliser notify_user_background() via
+    BackgroundTasks pour ne jamais retarder/faire échouer la réponse HTTP
+    si Google/FCM est lent ou injoignable (voir app/api_admin.py).
     """
-    creds = _get_credentials()
-    if creds is None:
-        return
-
     try:
-        access_token = _access_token(creds)
-    except Exception:  # noqa: BLE001
-        logger.exception("Impossible de rafraîchir le token OAuth2 FCM — push ignoré.")
-        return
+        creds = _get_credentials()
+        if creds is None:
+            return
 
-    settings = get_settings()
-    tokens = db.execute(select(DeviceToken).where(DeviceToken.user_id == user_id)).scalars().all()
-    if not tokens:
-        return
-
-    payload_data = data or {}
-    any_change = False
-    for device_token in tokens:
         try:
-            still_valid = _send_to_token(settings.FIREBASE_PROJECT_ID, access_token, device_token.token, title, body, payload_data)
-            if not still_valid:
-                db.delete(device_token)
-                any_change = True
+            access_token = _access_token(creds)
         except Exception:  # noqa: BLE001
-            logger.exception("Erreur inattendue lors de l'envoi push à un appareil.")
-    if any_change:
-        db.commit()
+            logger.exception("Impossible de rafraîchir le token OAuth2 FCM — push ignoré.")
+            return
+
+        settings = get_settings()
+        tokens = db.execute(select(DeviceToken).where(DeviceToken.user_id == user_id)).scalars().all()
+        if not tokens:
+            return
+
+        payload_data = data or {}
+        any_change = False
+        for device_token in tokens:
+            try:
+                still_valid = _send_to_token(settings.FIREBASE_PROJECT_ID, access_token, device_token.token, title, body, payload_data)
+                if not still_valid:
+                    db.delete(device_token)
+                    any_change = True
+            except Exception:  # noqa: BLE001
+                logger.exception("Erreur inattendue lors de l'envoi push à un appareil.")
+        if any_change:
+            db.commit()
+    except Exception:  # noqa: BLE001
+        # Filet de sécurité final : conformément au contrat "best-effort" de
+        # cette fonction, aucune erreur (DB, réseau, autre) ne doit jamais
+        # remonter à l'appelant.
+        logger.exception("Échec inattendu de l'envoi de notification push — ignoré.")
+
+
+def notify_user_background(
+    user_id: uuid.UUID | str,
+    *,
+    title: str,
+    body: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    """
+    Variante destinée à BackgroundTasks (FastAPI) : à utiliser depuis les
+    routes admin au lieu d'appeler notify_user() directement, pour que
+    l'envoi de la notification (potentiellement lent : auth Google + appel
+    FCM) se fasse APRÈS que la réponse HTTP a déjà été envoyée au client, et
+    ne bloque/ne fasse jamais échouer une action admin (confirmer un dépôt,
+    recharger un compte, valider un KYC...).
+
+    Ouvre sa propre session DB car celle de la requête d'origine est fermée
+    avant l'exécution de la tâche de fond.
+    """
+    from app.database import SyncSessionLocal
+
+    db = SyncSessionLocal()
+    try:
+        notify_user(db, user_id, title=title, body=body, data=data)
+    finally:
+        db.close()
