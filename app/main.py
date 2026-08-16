@@ -43,7 +43,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,  # authentification par Bearer token, pas par cookies —
+                               # pas besoin de credentials, et incompatible avec allow_origins=["*"]
     allow_methods=["*"],
     allow_headers=["*"],
 )
