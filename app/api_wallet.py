@@ -45,7 +45,7 @@ async def declare_payin(
     user: User = Depends(get_current_user),
     db: Annotated[Session, Depends(get_sync_db)] = None,  # noqa
 ):
-    if payload.provider.upper() not in ("WAVE", "ORANGE_MONEY"):
+    if payload.provider.upper() not in ("WAVE", "ORANGE", "MTN", "MOOV"):
         raise HTTPException(400, "Fournisseur de paiement invalide")
     result = declare_payin_pending(
         db,
@@ -76,7 +76,7 @@ async def declare_payin_async(
     Variante async — utile pour de gros volumes ou si on bascule
     en async psycopg uniquement.
     """
-    if payload.provider.upper() not in ("WAVE", "ORANGE_MONEY"):
+    if payload.provider.upper() not in ("WAVE", "ORANGE", "MTN", "MOOV"):
         raise HTTPException(400, "Fournisseur de paiement invalide")
     reference = generate_reference("PI")
     tx = LedgerTransaction(
@@ -105,7 +105,7 @@ async def payout_request(
     user: User = Depends(get_current_user),
     db: Annotated[Session, Depends(get_sync_db)] = None,
 ):
-    if payload.provider.upper() not in ("WAVE", "ORANGE_MONEY"):
+    if payload.provider.upper() not in ("WAVE", "ORANGE", "MTN", "MOOV"):
         raise HTTPException(400, "Fournisseur de paiement invalide")
     result = request_payout(
         db,

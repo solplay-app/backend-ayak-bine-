@@ -38,7 +38,7 @@ class BootstrapAdminRequest(BaseModel):
 class PayInDeclareRequest(BaseModel):
     """L'utilisateur déclare avoir transféré X FCFA sur le compte marchand."""
     amount: Decimal = Field(..., gt=0)
-    provider: str           # WAVE ou ORANGE_MONEY
+    provider: str           # WAVE, ORANGE, MTN ou MOOV
     phone_number: str
     # preuve fournie par le client (SMS opérateur ou ID dépôt Wave/OM)
     proof_ref: str | None = None
@@ -50,7 +50,7 @@ class PayInDeclareRequest(BaseModel):
 class PayInWebhookPayload(BaseModel):
     """Schéma générique d'un webhook Pay-In opérateur."""
     reference: str | None = None          # notre reference interne (PI-XXX) si connu
-    provider: str                         # WAVE ou ORANGE_MONEY
+    provider: str                         # WAVE, ORANGE, MTN ou MOOV
     proof_ref: str                        # ID transaction opérateur (unique côté eux)
     amount: Decimal = Field(..., gt=0)
     phone_number: str
@@ -60,7 +60,7 @@ class PayInWebhookPayload(BaseModel):
 
 class SMSListenerPayload(BaseModel):
     """Notification SMS opérateur parsée (Twilio webhook-out)."""
-    provider: str                         # WAVE ou ORANGE_MONEY
+    provider: str                         # WAVE, ORANGE, MTN ou MOOV
     body: str                             # corps brut du SMS
     from_number: str | None = None
     token: str                            # = SMS_LISTENER_TOKEN
@@ -68,7 +68,7 @@ class SMSListenerPayload(BaseModel):
 
 class PayOutRequest(BaseModel):
     amount: Decimal = Field(..., gt=0)
-    provider: str                         # WAVE ou ORANGE_MONEY
+    provider: str                         # WAVE, ORANGE, MTN ou MOOV
     phone_number: str
 
 

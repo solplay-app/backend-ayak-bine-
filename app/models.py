@@ -38,9 +38,11 @@ class PaymentProvider(str, enum.Enum):
     ORANGE = "ORANGE"
     MTN = "MTN"
     MOOV = "MOOV"
-    ORANGE_MONEY = "ORANGE_MONEY"  # ancienne valeur, gardée pour compat arrière
     INTERNAL = "INTERNAL"
     ADMIN_MANUAL = "ADMIN_MANUAL"
+    ORANGE_MONEY = "ORANGE_MONEY"  # legacy — conservé pour lire les lignes créées
+                                    # avant la migration_010 (valeur toujours en base,
+                                    # jamais renommée, seulement complétée par ORANGE)
 
 
 class KycStatus(str, enum.Enum):

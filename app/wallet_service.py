@@ -27,7 +27,7 @@ def declare_payin_pending(
 ) -> dict[str, Any]:
     """Crée la ligne PENDING côté ledger — pas de crédit avant validation webhook/SMS."""
     reference = generate_reference("PI")
-    provider_enum = provider.upper()  # 'WAVE' / 'ORANGE_MONEY'
+    provider_enum = provider.upper()  # 'WAVE' / 'ORANGE' / 'MTN' / 'MOOV'
     db.execute(
         text("""
             INSERT INTO ledger_transactions
