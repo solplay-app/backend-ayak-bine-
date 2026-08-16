@@ -14,9 +14,9 @@ from app.database import get_db, get_sync_db
 from app.models import LedgerTransaction, PaymentProvider, TransactionStatus, TransactionType, User, Wallet
 from app.schemas import (
     FeePercentResponse, InternalTransferRequest, InternalTransferResult,
-    PayInDeclareRequest, PayInResult, PayOutRequest, TransactionOut, WalletOut,
+    PayInDeclareRequest, PayInResult, PayOutRequest, PaymentLinksResponse, TransactionOut, WalletOut,
 )
-from app.wallet_service import declare_payin_pending, generate_reference, get_fee_percent, request_payout, transfer_internal
+from app.wallet_service import declare_payin_pending, generate_reference, get_fee_percent, get_payment_links, request_payout, transfer_internal
 
 router = APIRouter(prefix="/api/v1/wallet", tags=["Wallet"])
 
@@ -126,6 +126,17 @@ async def get_current_fee_percent(
 ):
     """Pourcentage de frais plateforme actuel — utilisé par l'app pour l'affichage en temps réel."""
     return FeePercentResponse(fee_percent=get_fee_percent(db))
+
+
+@router.get("/payment-links", response_model=PaymentLinksResponse)
+async def get_current_payment_links(
+    user: User = Depends(get_current_user),
+    db: Annotated[Session, Depends(get_sync_db)] = None,
+):
+    """Liens de paiement marchand (Wave, Orange Money...) configurés par
+    l'admin — l'app ouvre le bon lien selon l'opérateur choisi au dépôt.
+    """
+    return PaymentLinksResponse(**get_payment_links(db))
 
 
 @router.post("/transfer/internal", response_model=InternalTransferResult)
