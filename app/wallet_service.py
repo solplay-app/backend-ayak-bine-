@@ -209,6 +209,87 @@ def transfer_internal(
     return dict(result)
 
 
+_PAYMENT_LINK_KEYS = {
+    "wave": "payment_link_wave",
+    "orange": "payment_link_orange",
+    "mtn": "payment_link_mtn",
+    "moov": "payment_link_moov",
+}
+
+
+def get_payment_links(db: Session) -> dict[str, str | None]:
+    """Lit les liens de paiement marchand configurés par l'admin (Wave,
+    Orange Money, etc.) — utilisés par l'app pour rediriger le client au
+    moment du dépôt, en attendant une vraie intégration API opérateur.
+    """
+    rows = db.execute(
+        text("SELECT key, value FROM platform_settings WHERE key = ANY(:keys)"),
+        {"keys": list(_PAYMENT_LINK_KEYS.values())},
+    ).fetchall()
+    by_key = {r[0]: r[1] for r in rows}
+    return {name: by_key.get(dbkey) or None for name, dbkey in _PAYMENT_LINK_KEYS.items()}
+
+
+def set_payment_links(db: Session, links: dict[str, str | None]) -> None:
+    for name, value in links.items():
+        if name not in _PAYMENT_LINK_KEYS or value is None:
+            continue
+        db.execute(
+            text("""
+                INSERT INTO platform_settings (key, value, updated_at)
+                VALUES (:k, :v, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET value = :v, updated_at = CURRENT_TIMESTAMP
+            """),
+            {"k": _PAYMENT_LINK_KEYS[name], "v": value},
+        )
+    db.commit()
+
+
+def admin_manual_credit(
+    db: Session,
+    *,
+    user_id: str,
+    amount: Decimal,
+    reason: str,
+    admin_id: _uuid.UUID,
+) -> dict[str, Any]:
+    """Recharge manuelle par l'admin — dépannage, remboursement commercial,
+    ou avance de trésorerie avant qu'une vraie intégration opérateur existe.
+    Crédite immédiatement le wallet, trace l'opération dans le ledger.
+    """
+    if amount <= 0:
+        return {"success": False, "message": "Le montant doit être positif."}
+
+    reference = generate_reference("MC")
+    row = db.execute(
+        text("""
+            UPDATE wallets SET balance = balance + :amount, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = :uid
+            RETURNING balance
+        """),
+        {"amount": amount, "uid": user_id},
+    ).first()
+    if row is None:
+        return {"success": False, "message": "Portefeuille introuvable pour cet utilisateur."}
+
+    db.execute(
+        text("""
+            INSERT INTO ledger_transactions
+                (reference, user_id, type, provider, amount, fee, status, metadata)
+            VALUES
+                (:ref, :uid, 'PAY_IN', 'ADMIN_MANUAL', :amount, 0, 'SUCCESS', :meta)
+        """),
+        {
+            "ref": reference,
+            "uid": user_id,
+            "amount": amount,
+            "meta": json.dumps({"reason": reason, "credited_by_admin": str(admin_id)}),
+        },
+    )
+    db.commit()
+    return {"success": True, "message": "Compte rechargé avec succès.", "reference": reference, "new_balance": str(row[0])}
+
+
 def finalize_payin(
     db: Session,
     *,
