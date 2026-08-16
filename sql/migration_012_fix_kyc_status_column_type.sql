@@ -33,10 +33,25 @@ BEGIN
         UPDATE kyc_submissions SET status = 'PENDING'
          WHERE status NOT IN ('PENDING', 'APPROVED', 'REJECTED');
 
+        -- L'index partiel uq_kyc_active_per_user filtre sur `status`
+        -- (WHERE status IN ('PENDING','APPROVED')) : PostgreSQL refuse de
+        -- changer le type de la colonne tant qu'un index dépend d'elle
+        -- ("functions in index predicate must be marked IMMUTABLE"). On
+        -- supprime les deux index liés à `status`, puis on les recrée
+        -- juste après, identiques à leur définition dans la migration 002.
+        DROP INDEX IF EXISTS uq_kyc_active_per_user;
+        DROP INDEX IF EXISTS idx_kyc_status;
+
         ALTER TABLE kyc_submissions
             ALTER COLUMN status DROP DEFAULT,
             ALTER COLUMN status TYPE kyc_status USING status::kyc_status,
             ALTER COLUMN status SET DEFAULT 'PENDING';
+
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_kyc_active_per_user
+            ON kyc_submissions(user_id)
+            WHERE status IN ('PENDING', 'APPROVED');
+
+        CREATE INDEX IF NOT EXISTS idx_kyc_status ON kyc_submissions(status, created_at DESC);
     END IF;
 END
 $$;
