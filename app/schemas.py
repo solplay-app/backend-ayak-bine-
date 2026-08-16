@@ -124,6 +124,10 @@ class UserMeResponse(BaseModel):
         from_attributes = True
 
 
+class UserMeUpdateRequest(BaseModel):
+    full_name: str | None = None
+
+
 class KycSubmitRequest(BaseModel):
     id_document_base64: str = Field(..., min_length=10)
     selfie_base64: str | None = None

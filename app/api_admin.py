@@ -661,6 +661,99 @@ async def user_transaction_history(
     }
 
 
+# ---------- Liste des utilisateurs — page HTML (secret) -------------------
+
+@router.get("/users-page")
+async def users_html_page(
+    secret: str = Query(...),
+    search: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Page HTML listant tous les utilisateurs (nom, téléphone, solde, statut
+    KYC, actif/inactif), dans le même esprit que /kyc/pending : pas besoin
+    du dashboard JWT, une URL + le secret admin suffisent.
+
+    Utilisation (coller dans le navigateur) :
+      https://TON-SERVICE.onrender.com/api/v1/admin/users-page?secret=...
+    """
+    _check_secret(secret)
+
+    q = select(User, Wallet.balance).join(Wallet, Wallet.user_id == User.id, isouter=True)
+    if search:
+        like = f"%{search.strip()}%"
+        q = q.where((User.phone_number.ilike(like)) | (User.full_name.ilike(like)))
+    q = q.order_by(User.created_at.desc()).limit(500)
+    rows = (await db.execute(q)).all()
+
+    user_ids = [u.id for u, _ in rows]
+    kyc_map: dict = {}
+    if user_ids:
+        kyc_rows = (
+            await db.execute(
+                select(KycSubmission.user_id, KycSubmission.status)
+                .where(KycSubmission.user_id.in_(user_ids))
+                .order_by(KycSubmission.created_at.desc())
+            )
+        ).all()
+        for uid, kstatus in kyc_rows:
+            kyc_map.setdefault(uid, kstatus.value)
+
+    kyc_badge = {
+        "APPROVED": "background:#16a34a;color:white;",
+        "PENDING": "background:#eab308;color:#1a1a1a;",
+        "REJECTED": "background:#dc2626;color:white;",
+    }
+
+    if not rows:
+        table_rows = '<tr><td colspan="6" style="padding:16px;text-align:center;color:#888;">Aucun utilisateur trouvé.</td></tr>'
+    else:
+        parts = []
+        for u, balance in rows:
+            kstatus = kyc_map.get(u.id, "NON SOUMIS")
+            badge_style = kyc_badge.get(kstatus, "background:#e5e7eb;color:#444;")
+            status_label = "🟢 Actif" if u.is_active else "🔴 Désactivé"
+            parts.append(f"""
+            <tr style="border-bottom:1px solid #eee;">
+              <td style="padding:10px;">{u.full_name}</td>
+              <td style="padding:10px;">{u.phone_number}</td>
+              <td style="padding:10px;">{u.role.value}</td>
+              <td style="padding:10px;">{Decimal(balance or 0):,.0f} XOF</td>
+              <td style="padding:10px;"><span style="{badge_style}padding:4px 10px;border-radius:999px;font-size:12px;">{kstatus}</span></td>
+              <td style="padding:10px;">{status_label}</td>
+            </tr>
+            """)
+        table_rows = "".join(parts)
+
+    html = f"""
+    <html><head><meta charset="utf-8"><title>Utilisateurs — Ayak'bine</title></head>
+    <body style="font-family:sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;">
+      <h2>Liste des utilisateurs ({len(rows)})</h2>
+      <p><a href="/api/v1/admin/kyc/pending?secret={secret}">→ Voir les demandes KYC en attente</a></p>
+      <form method="get" style="margin-bottom:16px;">
+        <input type="hidden" name="secret" value="{secret}" />
+        <input type="text" name="search" placeholder="Rechercher (nom ou téléphone)" value="{search or ''}"
+               style="padding:8px;border:1px solid #ccc;border-radius:6px;width:280px;" />
+        <button type="submit" style="padding:8px 14px;border-radius:6px;border:none;background:#0E6E52;color:white;">Rechercher</button>
+      </form>
+      <table style="width:100%;border-collapse:collapse;">
+        <thead>
+          <tr style="text-align:left;border-bottom:2px solid #333;">
+            <th style="padding:10px;">Nom</th>
+            <th style="padding:10px;">Téléphone</th>
+            <th style="padding:10px;">Rôle</th>
+            <th style="padding:10px;">Solde</th>
+            <th style="padding:10px;">KYC</th>
+            <th style="padding:10px;">Statut</th>
+          </tr>
+        </thead>
+        <tbody>{table_rows}</tbody>
+      </table>
+    </body></html>
+    """
+    return HTMLResponse(content=html)
+
+
 # ---------- Vérification d'identité (KYC) — validation manuelle ----------
 
 @router.get("/kyc/pending")
@@ -715,6 +808,7 @@ async def kyc_pending_page(secret: str = Query(...), db: AsyncSession = Depends(
     <html><head><meta charset="utf-8"><title>Demandes KYC en attente</title></head>
     <body style="font-family:sans-serif;max-width:800px;margin:24px auto;padding:0 16px;">
       <h2>Demandes de vérification d'identité en attente</h2>
+      <p><a href="/api/v1/admin/users-page?secret={secret}">← Voir la liste des utilisateurs</a></p>
       {body}
     </body></html>
     """

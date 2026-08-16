@@ -7,7 +7,10 @@ from app.auth import create_access_token, get_current_user, hash_pin, verify_pin
 from app.config import get_settings
 from app.database import get_db
 from app.models import User, UserRole, Wallet
-from app.schemas import BootstrapAdminRequest, LoginRequest, RegisterRequest, TokenResponse, UserMeResponse
+from app.schemas import (
+    BootstrapAdminRequest, LoginRequest, RegisterRequest, TokenResponse,
+    UserMeResponse, UserMeUpdateRequest,
+)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Authentification"])
 settings = get_settings()
@@ -16,6 +19,29 @@ settings = get_settings()
 @router.get("/me", response_model=UserMeResponse)
 async def get_me(user: User = Depends(get_current_user)):
     """Retourne les informations du compte actuellement connecté."""
+    return UserMeResponse(
+        id=user.id,
+        phone_number=user.phone_number,
+        full_name=user.full_name,
+        role=user.role.value,
+        created_at=user.created_at,
+    )
+
+
+@router.put("/me", response_model=UserMeResponse)
+async def update_me(
+    payload: UserMeUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permet à l'utilisateur connecté de modifier ses informations (nom)."""
+    if payload.full_name is not None:
+        cleaned = payload.full_name.strip()
+        if not cleaned:
+            raise HTTPException(status_code=400, detail="Le nom ne peut pas être vide")
+        user.full_name = cleaned
+    await db.commit()
+    await db.refresh(user)
     return UserMeResponse(
         id=user.id,
         phone_number=user.phone_number,
