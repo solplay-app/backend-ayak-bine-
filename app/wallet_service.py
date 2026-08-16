@@ -36,7 +36,7 @@ def declare_payin_pending(
               (:ref, :uid, 'PAY_IN', CAST(:prov AS payment_provider),
                :amt, 'PENDING', :phone, :proof,
                CAST(:meta AS JSONB))
-            ON CONFLICT (provider, proof_ref) DO NOTHING
+            ON CONFLICT (provider, proof_ref) WHERE proof_ref IS NOT NULL DO NOTHING
             RETURNING id, reference
         """),
         {
