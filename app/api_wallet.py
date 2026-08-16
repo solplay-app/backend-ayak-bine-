@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.database import get_db, get_sync_db
 from app.models import LedgerTransaction, PaymentProvider, TransactionStatus, TransactionType, User, Wallet
+from app.push_service import notify_user
 from app.schemas import (
     FeePercentResponse, InternalTransferRequest, InternalTransferResult,
     PayInDeclareRequest, PayInResult, PayOutRequest, PaymentLinksResponse, TransactionOut, WalletOut,
@@ -154,6 +155,17 @@ async def transfer_internal_endpoint(
     )
     if not result["success"]:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=result["message"])
+
+    recipient = (
+        db.execute(select(User.id).where(User.phone_number == payload.recipient_phone))
+    ).first()
+    if recipient:
+        notify_user(
+            db, recipient[0],
+            title="Transfert reçu",
+            body=f"{result.get('net_amount', payload.amount)} XOF ont été crédités sur votre solde Ayak'bine par {user.phone_number}.",
+            data={"type": "wallet_credited", "reference": result.get("recipient_reference", "")},
+        )
     return InternalTransferResult(
         success=True,
         message=result["message"],

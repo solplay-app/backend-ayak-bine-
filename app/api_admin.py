@@ -32,6 +32,7 @@ from app.schemas import (
     FeePercentResponse, FeePercentUpdateRequest, KycDecisionRequest, PaymentLinksResponse,
     PaymentLinksUpdateRequest, UserStatusUpdateRequest,
 )
+from app.push_service import notify_user
 from app.wallet_service import (
     admin_manual_credit, admin_process_payout, finalize_payin,
     get_fee_percent, get_payment_links, set_fee_percent, set_payment_links,
@@ -428,6 +429,12 @@ async def credit_user_wallet(
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("message", "Échec de la recharge."))
+    notify_user(
+        db, user_id,
+        title="Solde rechargé",
+        body=f"{payload.amount} XOF ont été ajoutés à votre solde Ayak'bine.",
+        data={"type": "wallet_credited", "reference": result.get("reference", "")},
+    )
     return result
 
 
@@ -553,7 +560,7 @@ async def process_payin_route(
         return {"success": True, "message": f"Dépôt {row[0]} rejeté."}
 
     tx_row = db.execute(
-        text("SELECT reference, amount FROM ledger_transactions WHERE id = :tid AND type = 'PAY_IN'"),
+        text("SELECT reference, amount, user_id FROM ledger_transactions WHERE id = :tid AND type = 'PAY_IN'"),
         {"tid": transaction_id},
     ).first()
     if not tx_row:
@@ -567,6 +574,12 @@ async def process_payin_route(
     )
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("message", "Échec de la validation."))
+    notify_user(
+        db, tx_row.user_id,
+        title="Wallet rechargé",
+        body=f"{tx_row.amount} XOF ont été ajoutés à votre solde Ayak'bine.",
+        data={"type": "wallet_credited", "reference": tx_row.reference},
+    )
     return result
 
 

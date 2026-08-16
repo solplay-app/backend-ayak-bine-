@@ -22,3 +22,6 @@ bcrypt==4.0.1
 
 python-multipart==0.0.9
 tenacity==9.0.0
+
+# Notifications push (FCM HTTP v1) — auth OAuth2 du compte de service Google.
+google-auth==2.35.0

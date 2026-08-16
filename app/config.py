@@ -27,6 +27,12 @@ class Settings(BaseSettings):
 
     KYC_MAX_IMAGE_BASE64_CHARS: int = 6_000_000
 
+    # Notifications push (FCM HTTP v1). Si l'une des deux est absente, le
+    # push reste désactivé silencieusement (l'app continue de fonctionner
+    # avec le polling seul — voir app/push_service.py).
+    FIREBASE_PROJECT_ID: str = ""
+    FIREBASE_SERVICE_ACCOUNT_JSON: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:
